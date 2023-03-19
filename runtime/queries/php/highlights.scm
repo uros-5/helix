@@ -164,8 +164,6 @@
   "private" 
   "protected" 
   "public" 
-  "clone"
-  "unset"
 ] @keyword
 
 [

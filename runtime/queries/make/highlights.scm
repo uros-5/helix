@@ -45,9 +45,7 @@
  (raw_text)
 ] @string
 
-(variable_assignment (word) @variable)
-(shell_text
-  [(variable_reference (word) @variable.parameter)])
+(variable_assignment (word) @string)
 
 [
  "ifeq"
@@ -141,7 +139,6 @@
   function: "info"
   (arguments (text) @info))
 
-
 ;; Install Command Categories
 ;; Others special variables
 ;; Variables Used by Implicit Rules
@@ -171,5 +168,3 @@
 (targets
   (word) @constant.macro
   (#match? @constant.macro "^\.(PHONY|SUFFIXES|DEFAULT|PRECIOUS|INTERMEDIATE|SECONDARY|SECONDEXPANSION|DELETE_ON_ERROR|IGNORE|LOW_RESOLUTION_TIME|SILENT|EXPORT_ALL_VARIABLES|NOTPARALLEL|ONESHELL|POSIX)$"))
-
-(targets (word) @constant)

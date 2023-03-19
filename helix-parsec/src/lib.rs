@@ -459,7 +459,6 @@ pub fn zero_or_more<'a, P, T>(parser: P) -> impl Parser<'a, Output = Vec<T>>
 where
     P: Parser<'a, Output = T>,
 {
-    let parser = non_empty(parser);
     move |mut input| {
         let mut values = Vec::new();
 
@@ -492,7 +491,6 @@ pub fn one_or_more<'a, P, T>(parser: P) -> impl Parser<'a, Output = Vec<T>>
 where
     P: Parser<'a, Output = T>,
 {
-    let parser = non_empty(parser);
     move |mut input| {
         let mut values = Vec::new();
 
@@ -559,16 +557,5 @@ where
         }
 
         Ok((input, values))
-    }
-}
-
-pub fn non_empty<'a, T>(p: impl Parser<'a, Output = T>) -> impl Parser<'a, Output = T> {
-    move |input| {
-        let (new_input, res) = p.parse(input)?;
-        if new_input.len() == input.len() {
-            Err(input)
-        } else {
-            Ok((new_input, res))
-        }
     }
 }

@@ -12,7 +12,7 @@ pub enum CaseChange {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FormatItem<'a> {
-    Text(Tendril),
+    Text(&'a str),
     Capture(usize),
     CaseChange(usize, CaseChange),
     Conditional(usize, Option<&'a str>, Option<&'a str>),
@@ -20,9 +20,9 @@ pub enum FormatItem<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Regex<'a> {
-    value: Tendril,
+    value: &'a str,
     replacement: Vec<FormatItem<'a>>,
-    options: Tendril,
+    options: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -36,14 +36,14 @@ pub enum SnippetElement<'a> {
     },
     Choice {
         tabstop: usize,
-        choices: Vec<Tendril>,
+        choices: Vec<&'a str>,
     },
     Variable {
         name: &'a str,
         default: Option<&'a str>,
         regex: Option<Regex<'a>>,
     },
-    Text(Tendril),
+    Text(&'a str),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -67,12 +67,12 @@ fn render_elements(
 
     for element in snippet_elements {
         match element {
-            Text(text) => {
+            &Text(text) => {
                 // small optimization to avoid calling replace when it's unnecessary
                 let text = if text.contains('\n') {
                     Cow::Owned(text.replace('\n', newline_with_offset))
                 } else {
-                    Cow::Borrowed(text.as_str())
+                    Cow::Borrowed(text)
                 };
                 *offset += text.chars().count();
                 insert.push_str(&text);
@@ -160,7 +160,6 @@ pub fn render(
 }
 
 mod parser {
-    use helix_core::Tendril;
     use helix_parsec::*;
 
     use super::{CaseChange, FormatItem, Regex, Snippet, SnippetElement};
@@ -211,32 +210,8 @@ mod parser {
         }
     }
 
-    const TEXT_ESCAPE_CHARS: &[char] = &['\\', '}', '$'];
-    const REPLACE_ESCAPE_CHARS: &[char] = &['\\', '}', '$', '/'];
-    const CHOICE_TEXT_ESCAPE_CHARS: &[char] = &['\\', '}', '$', '|', ','];
-
-    fn text<'a>(escape_chars: &'static [char]) -> impl Parser<'a, Output = Tendril> {
-        move |input: &'a str| {
-            let mut chars = input.char_indices();
-            let mut res = Tendril::new();
-            while let Some((i, c)) = chars.next() {
-                match c {
-                    '\\' => {
-                        if let Some((_, c)) = chars.next() {
-                            if escape_chars.contains(&c) {
-                                res.push(c);
-                                continue;
-                            }
-                        }
-                        return Ok((&input[i..], res));
-                    }
-                    c if escape_chars.contains(&c) => return Ok((&input[i..], res)),
-                    c => res.push(c),
-                }
-            }
-
-            Ok(("", res))
-        }
+    fn text<'a, const SIZE: usize>(cs: [char; SIZE]) -> impl Parser<'a, Output = &'a str> {
+        take_while(move |c| cs.into_iter().all(|c1| c != c1))
     }
 
     fn digit<'a>() -> impl Parser<'a, Output = usize> {
@@ -299,18 +274,20 @@ mod parser {
     }
 
     fn regex<'a>() -> impl Parser<'a, Output = Regex<'a>> {
+        let text = map(text(['$', '/']), FormatItem::Text);
+        let replacement = reparse_as(
+            take_until(|c| c == '/'),
+            one_or_more(choice!(format(), text)),
+        );
+
         map(
             seq!(
                 "/",
-                // TODO parse as ECMAScript and convert to rust regex
-                non_empty(text(&['/', '\\'])),
+                take_until(|c| c == '/'),
                 "/",
-                one_or_more(choice!(
-                    format(),
-                    map(text(REPLACE_ESCAPE_CHARS), FormatItem::Text)
-                )),
+                replacement,
                 "/",
-                text(&['}', '\\',]),
+                optional(take_until(|c| c == '}')),
             ),
             |(_, value, _, replacement, _, options)| Regex {
                 value,
@@ -331,17 +308,13 @@ mod parser {
     }
 
     fn placeholder<'a>() -> impl Parser<'a, Output = SnippetElement<'a>> {
+        let text = map(text(['$', '}']), SnippetElement::Text);
         map(
             seq!(
                 "${",
                 digit(),
                 ":",
-                // according to the grammar there is just a single anything here.
-                // However in the prose it is explained that placeholders can be nested.
-                // The example there contains both a placeholder text and a nested placeholder
-                // which indicates a list. Looking at the VSCode sourcecode, the placeholder
-                // is indeed parsed as zero_or_more so the grammar is simply incorrect here
-                zero_or_more(anything(TEXT_ESCAPE_CHARS)),
+                one_or_more(choice!(anything(), text)),
                 "}"
             ),
             |seq| SnippetElement::Placeholder {
@@ -357,7 +330,7 @@ mod parser {
                 "${",
                 digit(),
                 "|",
-                sep(text(CHOICE_TEXT_ESCAPE_CHARS), ","),
+                sep(take_until(|c| c == ',' || c == '|'), ","),
                 "|}",
             ),
             |seq| SnippetElement::Choice {
@@ -395,33 +368,23 @@ mod parser {
         )
     }
 
-    fn anything<'a>(escape_chars: &'static [char]) -> impl Parser<'a, Output = SnippetElement<'a>> {
-        move |input: &'a str| {
-            let parser = choice!(
-                tabstop(),
-                placeholder(),
-                choice(),
-                variable(),
-                map(text(escape_chars), SnippetElement::Text)
-            );
+    fn anything<'a>() -> impl Parser<'a, Output = SnippetElement<'a>> {
+        // The parser has to be constructed lazily to avoid infinite opaque type recursion
+        |input: &'a str| {
+            let parser = choice!(tabstop(), placeholder(), choice(), variable());
             parser.parse(input)
         }
     }
 
     fn snippet<'a>() -> impl Parser<'a, Output = Snippet<'a>> {
-        map(one_or_more(anything(TEXT_ESCAPE_CHARS)), |parts| Snippet {
+        let text = map(text(['$']), SnippetElement::Text);
+        map(one_or_more(choice!(anything(), text)), |parts| Snippet {
             elements: parts,
         })
     }
 
     pub fn parse(s: &str) -> Result<Snippet, &str> {
-        snippet().parse(s).and_then(|(remainder, snippet)| {
-            if remainder.is_empty() {
-                Ok(snippet)
-            } else {
-                Err(remainder)
-            }
-        })
+        snippet().parse(s).map(|(_input, elements)| elements)
     }
 
     #[cfg(test)]
@@ -439,37 +402,15 @@ mod parser {
             assert_eq!(
                 Ok(Snippet {
                     elements: vec![
-                        Text("match(".into()),
+                        Text("match("),
                         Placeholder {
                             tabstop: 1,
-                            value: vec!(Text("Arg1".into())),
+                            value: vec!(Text("Arg1")),
                         },
-                        Text(")".into())
+                        Text(")")
                     ]
                 }),
                 parse("match(${1:Arg1})")
-            )
-        }
-
-        #[test]
-        fn parse_unterminated_placeholder_error() {
-            assert_eq!(Err("${1:)"), parse("match(${1:)"))
-        }
-
-        #[test]
-        fn parse_empty_placeholder() {
-            assert_eq!(
-                Ok(Snippet {
-                    elements: vec![
-                        Text("match(".into()),
-                        Placeholder {
-                            tabstop: 1,
-                            value: vec![],
-                        },
-                        Text(")".into())
-                    ]
-                }),
-                parse("match(${1:})")
             )
         }
 
@@ -478,15 +419,15 @@ mod parser {
             assert_eq!(
                 Ok(Snippet {
                     elements: vec![
-                        Text("local ".into()),
+                        Text("local "),
                         Placeholder {
                             tabstop: 1,
-                            value: vec!(Text("var".into())),
+                            value: vec!(Text("var")),
                         },
-                        Text(" = ".into()),
+                        Text(" = "),
                         Placeholder {
                             tabstop: 1,
-                            value: vec!(Text("value".into())),
+                            value: vec!(Text("value")),
                         },
                     ]
                 }),
@@ -500,7 +441,7 @@ mod parser {
                 Ok(Snippet {
                     elements: vec![Placeholder {
                         tabstop: 1,
-                        value: vec!(Text("var, ".into()), Tabstop { tabstop: 2 },),
+                        value: vec!(Text("var, "), Tabstop { tabstop: 2 },),
                     },]
                 }),
                 parse("${1:var, $2}")
@@ -514,10 +455,10 @@ mod parser {
                     elements: vec![Placeholder {
                         tabstop: 1,
                         value: vec!(
-                            Text("foo ".into()),
+                            Text("foo "),
                             Placeholder {
                                 tabstop: 2,
-                                value: vec!(Text("bar".into())),
+                                value: vec!(Text("bar")),
                             },
                         ),
                     },]
@@ -531,27 +472,27 @@ mod parser {
             assert_eq!(
                 Ok(Snippet {
                     elements: vec![
-                        Text("hello ".into()),
+                        Text("hello "),
                         Tabstop { tabstop: 1 },
                         Tabstop { tabstop: 2 },
-                        Text(" ".into()),
+                        Text(" "),
                         Choice {
                             tabstop: 1,
-                            choices: vec!["one".into(), "two".into(), "three".into()]
+                            choices: vec!["one", "two", "three"]
                         },
-                        Text(" ".into()),
+                        Text(" "),
                         Variable {
                             name: "name",
                             default: Some("foo"),
                             regex: None
                         },
-                        Text(" ".into()),
+                        Text(" "),
                         Variable {
                             name: "var",
                             default: None,
                             regex: None
                         },
-                        Text(" ".into()),
+                        Text(" "),
                         Variable {
                             name: "TM",
                             default: None,
@@ -571,9 +512,9 @@ mod parser {
                         name: "TM_FILENAME",
                         default: None,
                         regex: Some(Regex {
-                            value: "(.*).+$".into(),
+                            value: "(.*).+$",
                             replacement: vec![FormatItem::Capture(1)],
-                            options: Tendril::new(),
+                            options: None,
                         }),
                     }]
                 }),

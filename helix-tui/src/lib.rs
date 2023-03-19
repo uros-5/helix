@@ -25,12 +25,10 @@
 //! use std::io;
 //! use helix_tui::Terminal;
 //! use helix_tui::backend::CrosstermBackend;
-//! use helix_view::editor::Config;
 //!
 //! fn main() -> Result<(), io::Error> {
 //!     let stdout = io::stdout();
-//!     let config = Config::default();
-//!     let backend = CrosstermBackend::new(stdout, &config);
+//!     let backend = CrosstermBackend::new(stdout);
 //!     let mut terminal = Terminal::new(backend)?;
 //!     Ok(())
 //! }
@@ -58,13 +56,11 @@
 //! use helix_tui::backend::CrosstermBackend;
 //! use helix_tui::widgets::{Widget, Block, Borders};
 //! use helix_tui::layout::{Layout, Constraint, Direction};
-//! use helix_view::editor::Config;
 //!
 //! fn main() -> Result<(), io::Error> {
 //!     terminal::enable_raw_mode().unwrap();
 //!     let stdout = io::stdout();
-//!     let config = Config::default();
-//!     let backend = CrosstermBackend::new(stdout, &config);
+//!     let backend = CrosstermBackend::new(stdout);
 //!     let mut terminal = Terminal::new(backend)?;
 //!     // terminal.draw(|f| {
 //!     //     let size = f.size();
@@ -90,13 +86,11 @@
 //! use helix_tui::backend::CrosstermBackend;
 //! use helix_tui::widgets::{Widget, Block, Borders};
 //! use helix_tui::layout::{Layout, Constraint, Direction};
-//! use helix_view::editor::Config;
 //!
 //! fn main() -> Result<(), io::Error> {
 //!     terminal::enable_raw_mode().unwrap();
 //!     let stdout = io::stdout();
-//!     let config = Config::default();
-//!     let backend = CrosstermBackend::new(stdout, &config);
+//!     let backend = CrosstermBackend::new(stdout);
 //!     let mut terminal = Terminal::new(backend)?;
 //!     // terminal.draw(|f| {
 //!     //     let chunks = Layout::default()

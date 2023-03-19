@@ -29,6 +29,7 @@ use tokio::{
 #[derive(Debug)]
 pub struct Client {
     id: usize,
+    name: String,
     _process: Child,
     server_tx: UnboundedSender<Payload>,
     request_counter: AtomicU64,
@@ -41,8 +42,7 @@ pub struct Client {
 }
 
 impl Client {
-    #[allow(clippy::type_complexity)]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn start(
         cmd: &str,
         args: &[String],
@@ -50,6 +50,7 @@ impl Client {
         server_environment: HashMap<String, String>,
         root_markers: &[String],
         id: usize,
+        name: String,
         req_timeout: u64,
         doc_path: Option<&std::path::PathBuf>,
     ) -> Result<(Self, UnboundedReceiver<(usize, Call)>, Arc<Notify>)> {
@@ -74,7 +75,7 @@ impl Client {
         let stderr = BufReader::new(process.stderr.take().expect("Failed to open stderr"));
 
         let (server_rx, server_tx, initialize_notify) =
-            Transport::start(reader, writer, stderr, id);
+            Transport::start(reader, writer, stderr, id, name.clone());
 
         let root_path = find_root(
             doc_path.and_then(|x| x.parent().and_then(|x| x.to_str())),
@@ -100,6 +101,7 @@ impl Client {
 
         let client = Self {
             id,
+            name,
             _process: process,
             server_tx,
             request_counter: AtomicU64::new(0),
@@ -113,6 +115,10 @@ impl Client {
         };
 
         Ok((client, server_rx, initialize_notify))
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn id(&self) -> usize {
@@ -318,17 +324,6 @@ impl Client {
                     inlay_hint: Some(lsp::InlayHintWorkspaceClientCapabilities {
                         refresh_support: Some(false),
                     }),
-                    workspace_edit: Some(lsp::WorkspaceEditClientCapabilities {
-                        document_changes: Some(true),
-                        resource_operations: Some(vec![
-                            lsp::ResourceOperationKind::Create,
-                            lsp::ResourceOperationKind::Rename,
-                            lsp::ResourceOperationKind::Delete,
-                        ]),
-                        failure_handling: Some(lsp::FailureHandlingKind::Abort),
-                        normalizes_line_endings: Some(false),
-                        change_annotation_support: None,
-                    }),
                     ..Default::default()
                 }),
                 text_document: Some(lsp::TextDocumentClientCapabilities {
@@ -398,7 +393,6 @@ impl Client {
                         ..Default::default()
                     }),
                     publish_diagnostics: Some(lsp::PublishDiagnosticsClientCapabilities {
-                        version_support: Some(true),
                         ..Default::default()
                     }),
                     inlay_hint: Some(lsp::InlayHintClientCapabilities {
@@ -1148,23 +1142,20 @@ impl Client {
         Some(self.call::<lsp::request::CodeActionRequest>(params))
     }
 
-    pub fn supports_rename(&self) -> bool {
-        let capabilities = self.capabilities.get().unwrap();
-        matches!(
-            capabilities.rename_provider,
-            Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
-        )
-    }
-
     pub fn rename_symbol(
         &self,
         text_document: lsp::TextDocumentIdentifier,
         position: lsp::Position,
         new_name: String,
     ) -> Option<impl Future<Output = Result<lsp::WorkspaceEdit>>> {
-        if !self.supports_rename() {
-            return None;
-        }
+        let capabilities = self.capabilities.get().unwrap();
+
+        // Return early if the language server does not support renaming.
+        match capabilities.rename_provider {
+            Some(lsp::OneOf::Left(true)) | Some(lsp::OneOf::Right(_)) => (),
+            // None | Some(false)
+            _ => return None,
+        };
 
         let params = lsp::RenameParams {
             text_document_position: lsp::TextDocumentPositionParams {
