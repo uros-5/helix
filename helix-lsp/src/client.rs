@@ -4,7 +4,7 @@ use crate::{
     Call, Error, OffsetEncoding, Result,
 };
 
-use helix_core::{find_root, ChangeSet, Rope};
+use helix_core::{find_root, syntax::LanguageServerFeature, ChangeSet, Rope};
 use helix_loader::{self, VERSION_AND_GIT_HASH};
 use lsp::PositionEncodingKind;
 use lsp_types as lsp;
@@ -149,6 +149,93 @@ impl Client {
         self.capabilities
             .get()
             .expect("language server not yet initialized!")
+    }
+
+    #[inline] // TODO inline?
+    pub fn supports_feature(&self, feature: LanguageServerFeature) -> bool {
+        let capabilities = match self.capabilities.get() {
+            Some(capabilities) => capabilities,
+            None => return false, // not initialized, TODO unwrap/expect instead?
+        };
+        match feature {
+            LanguageServerFeature::Format => matches!(
+                capabilities.document_formatting_provider,
+                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+            ),
+            LanguageServerFeature::GotoDeclaration => matches!(
+                capabilities.declaration_provider,
+                Some(
+                    lsp::DeclarationCapability::Simple(true)
+                        | lsp::DeclarationCapability::RegistrationOptions(_)
+                        | lsp::DeclarationCapability::Options(_),
+                )
+            ),
+            LanguageServerFeature::GotoDefinition => matches!(
+                capabilities.definition_provider,
+                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+            ),
+            LanguageServerFeature::GotoTypeDefinition => matches!(
+                capabilities.type_definition_provider,
+                Some(
+                    lsp::TypeDefinitionProviderCapability::Simple(true)
+                        | lsp::TypeDefinitionProviderCapability::Options(_),
+                )
+            ),
+            LanguageServerFeature::GotoReference => matches!(
+                capabilities.references_provider,
+                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+            ),
+            LanguageServerFeature::GotoImplementation => matches!(
+                capabilities.implementation_provider,
+                Some(
+                    lsp::ImplementationProviderCapability::Simple(true)
+                        | lsp::ImplementationProviderCapability::Options(_),
+                )
+            ),
+            LanguageServerFeature::SignatureHelp => capabilities.signature_help_provider.is_some(),
+            LanguageServerFeature::Hover => matches!(
+                capabilities.hover_provider,
+                Some(
+                    lsp::HoverProviderCapability::Simple(true)
+                        | lsp::HoverProviderCapability::Options(_),
+                )
+            ),
+            LanguageServerFeature::DocumentHighlight => matches!(
+                capabilities.document_highlight_provider,
+                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+            ),
+            LanguageServerFeature::Completion => capabilities.completion_provider.is_some(),
+            LanguageServerFeature::CodeAction => matches!(
+                capabilities.code_action_provider,
+                Some(
+                    lsp::CodeActionProviderCapability::Simple(true)
+                        | lsp::CodeActionProviderCapability::Options(_),
+                )
+            ),
+            LanguageServerFeature::WorkspaceCommand => {
+                capabilities.execute_command_provider.is_some()
+            }
+            LanguageServerFeature::DocumentSymbols => matches!(
+                capabilities.document_symbol_provider,
+                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+            ),
+            LanguageServerFeature::WorkspaceSymbols => matches!(
+                capabilities.workspace_symbol_provider,
+                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+            ),
+            LanguageServerFeature::Diagnostics => true, // there's no extra server capability
+            LanguageServerFeature::RenameSymbol => matches!(
+                capabilities.rename_provider,
+                Some(lsp::OneOf::Left(true)) | Some(lsp::OneOf::Right(_))
+            ),
+            LanguageServerFeature::InlayHints => matches!(
+                capabilities.inlay_hint_provider,
+                Some(
+                    lsp::OneOf::Left(true)
+                        | lsp::OneOf::Right(lsp::InlayHintServerCapabilities::Options(_))
+                )
+            ),
+        }
     }
 
     pub fn offset_encoding(&self) -> OffsetEncoding {
@@ -324,6 +411,17 @@ impl Client {
                     inlay_hint: Some(lsp::InlayHintWorkspaceClientCapabilities {
                         refresh_support: Some(false),
                     }),
+                    workspace_edit: Some(lsp::WorkspaceEditClientCapabilities {
+                        document_changes: Some(true),
+                        resource_operations: Some(vec![
+                            lsp::ResourceOperationKind::Create,
+                            lsp::ResourceOperationKind::Rename,
+                            lsp::ResourceOperationKind::Delete,
+                        ]),
+                        failure_handling: Some(lsp::FailureHandlingKind::Abort),
+                        normalizes_line_endings: Some(false),
+                        change_annotation_support: None,
+                    }),
                     ..Default::default()
                 }),
                 text_document: Some(lsp::TextDocumentClientCapabilities {
@@ -393,6 +491,7 @@ impl Client {
                         ..Default::default()
                     }),
                     publish_diagnostics: Some(lsp::PublishDiagnosticsClientCapabilities {
+                        version_support: Some(true),
                         ..Default::default()
                     }),
                     inlay_hint: Some(lsp::InlayHintClientCapabilities {
@@ -1148,14 +1247,9 @@ impl Client {
         position: lsp::Position,
         new_name: String,
     ) -> Option<impl Future<Output = Result<lsp::WorkspaceEdit>>> {
-        let capabilities = self.capabilities.get().unwrap();
-
-        // Return early if the language server does not support renaming.
-        match capabilities.rename_provider {
-            Some(lsp::OneOf::Left(true)) | Some(lsp::OneOf::Right(_)) => (),
-            // None | Some(false)
-            _ => return None,
-        };
+        if !self.supports_feature(LanguageServerFeature::RenameSymbol) {
+            return None;
+        }
 
         let params = lsp::RenameParams {
             text_document_position: lsp::TextDocumentPositionParams {

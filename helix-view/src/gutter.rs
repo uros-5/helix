@@ -1,5 +1,7 @@
 use std::fmt::Write;
 
+use helix_core::{syntax::LanguageServerFeature, Diagnostic};
+
 use crate::{
     editor::GutterType,
     graphics::{Color, Style, UnderlineStyle},
@@ -55,7 +57,7 @@ pub fn diagnostic<'doc>(
     let error = theme.get("error");
     let info = theme.get("info");
     let hint = theme.get("hint");
-    let diagnostics = doc.shown_diagnostics().collect::<Vec<_>>();
+    let diagnostics = &doc.diagnostics;
 
     Box::new(
         move |line: usize, _selected: bool, first_visual_line: bool, out: &mut String| {
@@ -64,25 +66,32 @@ pub fn diagnostic<'doc>(
             }
             use helix_core::diagnostic::Severity;
             if let Ok(index) = diagnostics.binary_search_by_key(&line, |d| d.line) {
-                let after = diagnostics[index..].iter().take_while(|d| d.line == line);
+                let on_line_and_is_visible = |d: &&Diagnostic| {
+                    d.line == line
+                        && doc
+                            .language_servers_with_feature(LanguageServerFeature::Diagnostics)
+                            .any(|ls| ls.id() == d.language_server_id)
+                };
+                let after = diagnostics[index..]
+                    .iter()
+                    .take_while(on_line_and_is_visible);
 
                 let before = diagnostics[..index]
                     .iter()
                     .rev()
-                    .take_while(|d| d.line == line);
+                    .take_while(on_line_and_is_visible);
 
                 let diagnostics_on_line = after.chain(before);
 
-                // This unwrap is safe because the iterator cannot be empty as it contains at least the item found by the binary search.
-                let diagnostic = diagnostics_on_line.max_by_key(|d| d.severity).unwrap();
-
-                write!(out, "●").unwrap();
-                return Some(match diagnostic.severity {
-                    Some(Severity::Error) => error,
-                    Some(Severity::Warning) | None => warning,
-                    Some(Severity::Info) => info,
-                    Some(Severity::Hint) => hint,
-                });
+                if let Some(diagnostic) = diagnostics_on_line.max_by_key(|d| d.severity) {
+                    write!(out, "●").ok();
+                    return Some(match diagnostic.severity {
+                        Some(Severity::Error) => error,
+                        Some(Severity::Warning) | None => warning,
+                        Some(Severity::Info) => info,
+                        Some(Severity::Hint) => hint,
+                    });
+                }
             }
             None
         },

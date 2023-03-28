@@ -263,6 +263,8 @@ pub struct Config {
     pub cursor_shape: CursorShapeConfig,
     /// Set to `true` to override automatic detection of terminal truecolor support in the event of a false negative. Defaults to `false`.
     pub true_color: bool,
+    /// Set to `true` to override automatic detection of terminal undercurl support in the event of a false negative. Defaults to `false`.
+    pub undercurl: bool,
     /// Search configuration.
     #[serde(default)]
     pub search: SearchConfig,
@@ -683,7 +685,7 @@ pub struct WhitespaceCharacters {
 impl Default for WhitespaceCharacters {
     fn default() -> Self {
         Self {
-            space: '·',   // U+00B7
+            space: '·',    // U+00B7
             nbsp: '⍽',    // U+237D
             tab: '→',     // U+2192
             newline: '⏎', // U+23CE
@@ -737,6 +739,7 @@ impl Default for Config {
             statusline: StatusLineConfig::default(),
             cursor_shape: CursorShapeConfig::default(),
             true_color: false,
+            undercurl: false,
             search: SearchConfig::default(),
             lsp: LspConfig::default(),
             terminal: get_terminal_provider(),
@@ -1088,6 +1091,9 @@ impl Editor {
             return None;
         }
         let doc = self.documents.get_mut(&doc_id)?;
+        // if doc doesn't have a URL it's a scratch buffer, ignore it
+        let doc_url = doc.url()?;
+
         // try to find language servers based on the language name
         let language_servers = doc.language.as_ref().and_then(|language| {
             self.language_servers
@@ -1102,37 +1108,37 @@ impl Editor {
                 .ok()
         });
 
-        // if doc doesn't have a URL it's a scratch buffer, ignore it
-        let doc_url = doc.url()?;
-
         if let Some(language_servers) = language_servers {
-            // only spawn new lang servers if the servers aren't the same
-            // TODO simplify?
-            let doc_language_servers = doc.language_servers().collect::<Vec<_>>();
-            let spawn_new_servers = language_servers.len() != doc_language_servers.len()
-                || language_servers
-                    .iter()
-                    .zip(doc_language_servers.iter())
-                    .any(|(l, dl)| l.id() != dl.id());
-            if spawn_new_servers {
-                for doc_language_server in doc_language_servers {
-                    tokio::spawn(doc_language_server.text_document_did_close(doc.identifier()));
-                }
+            let language_id = doc.language_id().map(ToOwned::to_owned).unwrap_or_default();
 
-                let language_id = doc.language_id().map(ToOwned::to_owned).unwrap_or_default();
+            // only spawn new language servers if the servers aren't the same
 
-                for language_server in &language_servers {
-                    // TODO: this now races with on_init code if the init happens too quickly
-                    tokio::spawn(language_server.text_document_did_open(
-                        doc_url.clone(),
-                        doc.version(),
-                        doc.text(),
-                        language_id.clone(),
-                    ));
-                }
+            let doc_language_servers_not_in_registry =
+                doc.language_servers.iter().filter(|(name, doc_ls)| {
+                    !language_servers.contains_key(*name)
+                        || language_servers[*name].id() != doc_ls.id()
+                });
 
-                doc.set_language_servers(language_servers);
+            for (_, language_server) in doc_language_servers_not_in_registry {
+                tokio::spawn(language_server.text_document_did_close(doc.identifier()));
             }
+
+            let language_servers_not_in_doc = language_servers.iter().filter(|(name, ls)| {
+                !doc.language_servers.contains_key(*name)
+                    || doc.language_servers[*name].id() != ls.id()
+            });
+
+            for (_, language_server) in language_servers_not_in_doc {
+                // TODO: this now races with on_init code if the init happens too quickly
+                tokio::spawn(language_server.text_document_did_open(
+                    doc_url.clone(),
+                    doc.version(),
+                    doc.text(),
+                    language_id.clone(),
+                ));
+            }
+
+            doc.language_servers = language_servers;
         }
         Some(())
     }

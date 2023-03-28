@@ -37,9 +37,35 @@ use crate::{
 };
 
 use std::{
-    borrow::Cow, cmp::Ordering, collections::BTreeMap, fmt::Write, future::Future, path::PathBuf,
+    cmp::Ordering,
+    collections::{BTreeMap, HashSet},
+    fmt::Write,
+    future::Future,
+    path::PathBuf,
     sync::Arc,
 };
+
+/// Gets the first language server that is attached to a document which supports a specific feature.
+/// If there is no configured language server that supports the feature, this displays a status message.
+/// Using this macro in a context where the editor automatically queries the LSP
+/// (instead of when the user explicitly does so via a keybind like `gd`)
+/// will spam the "No configured language server supports <feature>" status message confusingly.
+#[macro_export]
+macro_rules! language_server_with_feature {
+    ($editor:expr, $doc:expr, $feature:expr) => {{
+        let language_server = $doc.language_servers_with_feature($feature).next();
+        match language_server {
+            Some(language_server) => language_server,
+            None => {
+                $editor.set_status(format!(
+                    "No configured language server supports {}",
+                    $feature
+                ));
+                return;
+            }
+        }
+    }};
+}
 
 impl ui::menu::Item for lsp::Location {
     /// Current working directory.
@@ -136,15 +162,11 @@ impl ui::menu::Item for PickerDiagnostic {
         // remove background as it is distracting in the picker list
         style.bg = None;
 
-        let code: Cow<'_, str> = self
-            .diag
-            .code
-            .as_ref()
-            .map(|c| match c {
-                NumberOrString::Number(n) => n.to_string().into(),
-                NumberOrString::String(s) => s.as_str().into(),
-            })
-            .unwrap_or_default();
+        let code = match self.diag.code.as_ref() {
+            Some(NumberOrString::Number(n)) => format!(" ({n})"),
+            Some(NumberOrString::String(s)) => format!(" ({s})"),
+            None => String::new(),
+        };
 
         let path = match format {
             DiagnosticsFormat::HideSourcePath => String::new(),
@@ -354,45 +376,50 @@ pub fn symbol_picker(cx: &mut Context) {
     }
     let doc = doc!(cx.editor);
 
+    let mut seen_language_servers = HashSet::new();
+
     let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::DocumentSymbols)
-        .filter_map(|ls| {
-            let request = ls.document_symbols(doc.identifier())?;
-            Some((request, ls.offset_encoding(), doc.identifier()))
-        })
-        .map(|(request, offset_encoding, doc_id)| async move {
-            let json = request.await?;
-            let response: Option<lsp::DocumentSymbolResponse> = serde_json::from_value(json)?;
-            let symbols = match response {
-                Some(symbols) => symbols,
-                None => return anyhow::Ok(vec![]),
-            };
-            // lsp has two ways to represent symbols (flat/nested)
-            // convert the nested variant to flat, so that we have a homogeneous list
-            let symbols = match symbols {
-                lsp::DocumentSymbolResponse::Flat(symbols) => symbols
-                    .into_iter()
-                    .map(|symbol| SymbolInformationItem {
-                        symbol,
-                        offset_encoding,
-                    })
-                    .collect(),
-                lsp::DocumentSymbolResponse::Nested(symbols) => {
-                    let mut flat_symbols = Vec::new();
-                    for symbol in symbols {
-                        nested_to_flat(&mut flat_symbols, &doc_id, symbol, offset_encoding)
+        .filter(|ls| seen_language_servers.insert(ls.id()))
+        .map(|language_server| {
+            let request = language_server.document_symbols(doc.identifier()).unwrap();
+            let offset_encoding = language_server.offset_encoding();
+            let doc_id = doc.identifier();
+
+            async move {
+                let json = request.await?;
+                let response: Option<lsp::DocumentSymbolResponse> = serde_json::from_value(json)?;
+                let symbols = match response {
+                    Some(symbols) => symbols,
+                    None => return anyhow::Ok(vec![]),
+                };
+                // lsp has two ways to represent symbols (flat/nested)
+                // convert the nested variant to flat, so that we have a homogeneous list
+                let symbols = match symbols {
+                    lsp::DocumentSymbolResponse::Flat(symbols) => symbols
+                        .into_iter()
+                        .map(|symbol| SymbolInformationItem {
+                            symbol,
+                            offset_encoding,
+                        })
+                        .collect(),
+                    lsp::DocumentSymbolResponse::Nested(symbols) => {
+                        let mut flat_symbols = Vec::new();
+                        for symbol in symbols {
+                            nested_to_flat(&mut flat_symbols, &doc_id, symbol, offset_encoding)
+                        }
+                        flat_symbols
                     }
-                    flat_symbols
-                }
-            };
-            Ok(symbols)
+                };
+                Ok(symbols)
+            }
         })
         .collect();
     let current_url = doc.url();
 
     if futures.is_empty() {
         cx.editor
-            .set_error("No Language server does support document symbols");
+            .set_error("No configured language server supports document symbols");
         return;
     }
 
@@ -402,11 +429,7 @@ pub fn symbol_picker(cx: &mut Context) {
         while let Some(mut lsp_items) = futures.try_next().await? {
             symbols.append(&mut lsp_items);
         }
-        let call = move |editor: &mut Editor, compositor: &mut Compositor| {
-            if symbols.is_empty() {
-                editor.set_error("No symbols available");
-                return;
-            }
+        let call = move |_editor: &mut Editor, compositor: &mut Compositor| {
             let picker = sym_picker(symbols, current_url);
             compositor.push(Box::new(overlayed(picker)))
         };
@@ -420,27 +443,33 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
 
     let get_symbols = move |pattern: String, editor: &mut Editor| {
         let doc = doc!(editor);
+        let mut seen_language_servers = HashSet::new();
         let mut futures: FuturesUnordered<_> = doc
             .language_servers_with_feature(LanguageServerFeature::WorkspaceSymbols)
-            .filter_map(|ls| Some((ls.workspace_symbols(pattern.clone())?, ls.offset_encoding())))
-            .map(|(request, offset_encoding)| async move {
-                let json = request.await?;
+            .filter(|ls| seen_language_servers.insert(ls.id()))
+            .map(|language_server| {
+                let request = language_server.workspace_symbols(pattern.clone()).unwrap();
+                let offset_encoding = language_server.offset_encoding();
+                async move {
+                    let json = request.await?;
 
-                let response = serde_json::from_value::<Option<Vec<lsp::SymbolInformation>>>(json)?
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|symbol| SymbolInformationItem {
-                        symbol,
-                        offset_encoding,
-                    })
-                    .collect();
+                    let response =
+                        serde_json::from_value::<Option<Vec<lsp::SymbolInformation>>>(json)?
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|symbol| SymbolInformationItem {
+                                symbol,
+                                offset_encoding,
+                            })
+                            .collect();
 
-                anyhow::Ok(response)
+                    anyhow::Ok(response)
+                }
             })
             .collect();
 
         if futures.is_empty() {
-            editor.set_error("No Language server does support workspace symbols");
+            editor.set_error("No configured language server supports workspace symbols");
         }
 
         async move {
@@ -504,7 +533,6 @@ pub fn workspace_diagnostics_picker(cx: &mut Context) {
 
 struct CodeActionOrCommandItem {
     lsp_item: lsp::CodeActionOrCommand,
-    offset_encoding: OffsetEncoding,
     language_server_id: usize,
 }
 
@@ -580,8 +608,11 @@ pub fn code_action(cx: &mut Context) {
 
     let selection_range = doc.selection(view.id).primary();
 
+    let mut seen_language_servers = HashSet::new();
+
     let mut futures: FuturesUnordered<_> = doc
         .language_servers_with_feature(LanguageServerFeature::CodeAction)
+        .filter(|ls| seen_language_servers.insert(ls.id()))
         // TODO this should probably already been filtered in something like "language_servers_with_feature"
         .filter_map(|language_server| {
             let offset_encoding = language_server.offset_encoding();
@@ -603,9 +634,9 @@ pub fn code_action(cx: &mut Context) {
             };
             let code_action_request =
                 language_server.code_actions(doc.identifier(), range, code_action_context)?;
-            Some((code_action_request, offset_encoding, language_server_id))
+            Some((code_action_request, language_server_id))
         })
-        .map(|(request, offset_encoding, ls_id)| async move {
+        .map(|(request, ls_id)| async move {
             let json = request.await?;
             let response: Option<lsp::CodeActionResponse> = serde_json::from_value(json)?;
             let mut actions = match response {
@@ -661,7 +692,6 @@ pub fn code_action(cx: &mut Context) {
                 .into_iter()
                 .map(|lsp_item| CodeActionOrCommandItem {
                     lsp_item,
-                    offset_encoding,
                     language_server_id: ls_id,
                 })
                 .collect())
@@ -670,7 +700,7 @@ pub fn code_action(cx: &mut Context) {
 
     if futures.is_empty() {
         cx.editor
-            .set_error("No Language server does support code actions");
+            .set_error("No configured language server supports code actions");
         return;
     }
 
@@ -693,7 +723,11 @@ pub fn code_action(cx: &mut Context) {
 
                 // always present here
                 let action = action.unwrap();
-                let offset_encoding = action.offset_encoding;
+                let Some(language_server) = editor.language_servers.get_by_id(action.language_server_id) else {
+                    editor.set_error("Language Server disappeared");
+                    return;
+                };
+                let offset_encoding = language_server.offset_encoding();
 
                 match &action.lsp_item {
                     lsp::CodeActionOrCommand::Command(command) => {
@@ -704,7 +738,7 @@ pub fn code_action(cx: &mut Context) {
                         log::debug!("code action: {:?}", code_action);
                         if let Some(ref workspace_edit) = code_action.edit {
                             log::debug!("edit: {:?}", workspace_edit);
-                            apply_workspace_edit(editor, offset_encoding, workspace_edit);
+                            let _ = apply_workspace_edit(editor, offset_encoding, workspace_edit);
                         }
 
                         // if code action provides both edit and command first the edit
@@ -813,19 +847,50 @@ pub fn apply_document_resource_op(op: &lsp::ResourceOp) -> std::io::Result<()> {
     }
 }
 
+#[derive(Debug)]
+pub struct ApplyEditError {
+    pub kind: ApplyEditErrorKind,
+    pub failed_change_idx: usize,
+}
+
+#[derive(Debug)]
+pub enum ApplyEditErrorKind {
+    DocumentChanged,
+    FileNotFound,
+    UnknownURISchema,
+    IoError(std::io::Error),
+    // TODO: check edits before applying and propagate failure
+    // InvalidEdit,
+}
+
+impl ToString for ApplyEditErrorKind {
+    fn to_string(&self) -> String {
+        match self {
+            ApplyEditErrorKind::DocumentChanged => "document has changed".to_string(),
+            ApplyEditErrorKind::FileNotFound => "file not found".to_string(),
+            ApplyEditErrorKind::UnknownURISchema => "URI schema not supported".to_string(),
+            ApplyEditErrorKind::IoError(err) => err.to_string(),
+        }
+    }
+}
+
+///TODO make this transactional (and set failureMode to transactional)
 pub fn apply_workspace_edit(
     editor: &mut Editor,
     offset_encoding: OffsetEncoding,
     workspace_edit: &lsp::WorkspaceEdit,
-) {
-    let mut apply_edits = |uri: &helix_lsp::Url, text_edits: Vec<lsp::TextEdit>| {
+) -> Result<(), ApplyEditError> {
+    let mut apply_edits = |uri: &helix_lsp::Url,
+                           version: Option<i32>,
+                           text_edits: Vec<lsp::TextEdit>|
+     -> Result<(), ApplyEditErrorKind> {
         let path = match uri.to_file_path() {
             Ok(path) => path,
             Err(_) => {
                 let err = format!("unable to convert URI to filepath: {}", uri);
                 log::error!("{}", err);
                 editor.set_error(err);
-                return;
+                return Err(ApplyEditErrorKind::UnknownURISchema);
             }
         };
 
@@ -836,11 +901,19 @@ pub fn apply_workspace_edit(
                 let err = format!("failed to open document: {}: {}", uri, err);
                 log::error!("{}", err);
                 editor.set_error(err);
-                return;
+                return Err(ApplyEditErrorKind::FileNotFound);
             }
         };
 
         let doc = doc_mut!(editor, &doc_id);
+        if let Some(version) = version {
+            if version != doc.version() {
+                let err = format!("outdated workspace edit for {path:?}");
+                log::error!("{err}, expected {} but got {version}", doc.version());
+                editor.set_error(err);
+                return Err(ApplyEditErrorKind::DocumentChanged);
+            }
+        }
 
         // Need to determine a view for apply/append_changes_to_history
         let selections = doc.selections();
@@ -864,31 +937,13 @@ pub fn apply_workspace_edit(
         let view = view_mut!(editor, view_id);
         doc.apply(&transaction, view.id);
         doc.append_changes_to_history(view);
+        Ok(())
     };
-
-    if let Some(ref changes) = workspace_edit.changes {
-        log::debug!("workspace changes: {:?}", changes);
-        for (uri, text_edits) in changes {
-            let text_edits = text_edits.to_vec();
-            apply_edits(uri, text_edits)
-        }
-        return;
-        // Not sure if it works properly, it'll be safer to just panic here to avoid breaking some parts of code on which code actions will be used
-        // TODO: find some example that uses workspace changes, and test it
-        // for (url, edits) in changes.iter() {
-        //     let file_path = url.origin().ascii_serialization();
-        //     let file_path = std::path::PathBuf::from(file_path);
-        //     let file = std::fs::File::open(file_path).unwrap();
-        //     let mut text = Rope::from_reader(file).unwrap();
-        //     let transaction = edits_to_changes(&text, edits);
-        //     transaction.apply(&mut text);
-        // }
-    }
 
     if let Some(ref document_changes) = workspace_edit.document_changes {
         match document_changes {
             lsp::DocumentChanges::Edits(document_edits) => {
-                for document_edit in document_edits {
+                for (i, document_edit) in document_edits.iter().enumerate() {
                     let edits = document_edit
                         .edits
                         .iter()
@@ -900,15 +955,26 @@ pub fn apply_workspace_edit(
                         })
                         .cloned()
                         .collect();
-                    apply_edits(&document_edit.text_document.uri, edits);
+                    apply_edits(
+                        &document_edit.text_document.uri,
+                        document_edit.text_document.version,
+                        edits,
+                    )
+                    .map_err(|kind| ApplyEditError {
+                        kind,
+                        failed_change_idx: i,
+                    })?;
                 }
             }
             lsp::DocumentChanges::Operations(operations) => {
                 log::debug!("document changes - operations: {:?}", operations);
-                for operation in operations {
+                for (i, operation) in operations.iter().enumerate() {
                     match operation {
                         lsp::DocumentChangeOperation::Op(op) => {
-                            apply_document_resource_op(op).unwrap();
+                            apply_document_resource_op(op).map_err(|io| ApplyEditError {
+                                kind: ApplyEditErrorKind::IoError(io),
+                                failed_change_idx: i,
+                            })?;
                         }
 
                         lsp::DocumentChangeOperation::Edit(document_edit) => {
@@ -923,13 +989,36 @@ pub fn apply_workspace_edit(
                                 })
                                 .cloned()
                                 .collect();
-                            apply_edits(&document_edit.text_document.uri, edits);
+                            apply_edits(
+                                &document_edit.text_document.uri,
+                                document_edit.text_document.version,
+                                edits,
+                            )
+                            .map_err(|kind| ApplyEditError {
+                                kind,
+                                failed_change_idx: i,
+                            })?;
                         }
                     }
                 }
             }
         }
+
+        return Ok(());
     }
+
+    if let Some(ref changes) = workspace_edit.changes {
+        log::debug!("workspace changes: {:?}", changes);
+        for (i, (uri, text_edits)) in changes.iter().enumerate() {
+            let text_edits = text_edits.to_vec();
+            apply_edits(uri, None, text_edits).map_err(|kind| ApplyEditError {
+                kind,
+                failed_change_idx: i,
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn goto_impl(
@@ -982,21 +1071,19 @@ where
     F: Future<Output = helix_lsp::Result<serde_json::Value>> + 'static + Send,
 {
     let (view, doc) = current!(cx.editor);
-    if let Some((future, offset_encoding)) =
-        doc.run_on_first_supported_language_server(view.id, feature, |ls, encoding, pos, doc_id| {
-            Some((request_provider(ls, pos, doc_id)?, encoding))
-        })
-    {
-        cx.callback(
-            future,
-            move |editor, compositor, response: Option<lsp::GotoDefinitionResponse>| {
-                let items = to_locations(response);
-                goto_impl(editor, compositor, items, offset_encoding);
-            },
-        );
-    } else {
-        cx.editor.set_error("No language server supports {feature}");
-    }
+
+    let language_server = language_server_with_feature!(cx.editor, doc, feature);
+    let offset_encoding = language_server.offset_encoding();
+    let pos = doc.position(view.id, offset_encoding);
+    let future = request_provider(language_server, pos, doc.identifier()).unwrap();
+
+    cx.callback(
+        future,
+        move |editor, compositor, response: Option<lsp::GotoDefinitionResponse>| {
+            let items = to_locations(response);
+            goto_impl(editor, compositor, items, offset_encoding);
+        },
+    );
 }
 
 pub fn goto_declaration(cx: &mut Context) {
@@ -1033,22 +1120,24 @@ pub fn goto_implementation(cx: &mut Context) {
 
 pub fn goto_reference(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    if let Some((future, offset_encoding)) = doc.run_on_first_supported_language_server(
-        view.id,
-        LanguageServerFeature::GotoReference,
-        |ls, encoding, pos, doc_id| Some((ls.goto_reference(doc_id, pos, None)?, encoding)),
-    ) {
-        cx.callback(
-            future,
-            move |editor, compositor, response: Option<Vec<lsp::Location>>| {
-                let items = response.unwrap_or_default();
-                goto_impl(editor, compositor, items, offset_encoding);
-            },
-        );
-    } else {
-        cx.editor
-            .set_error("No language server supports goto-reference");
-    }
+
+    // TODO could probably support multiple language servers,
+    // not sure if there's a real practical use case for this though
+    let language_server =
+        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::GotoReference);
+    let offset_encoding = language_server.offset_encoding();
+    let pos = doc.position(view.id, offset_encoding);
+    let future = language_server
+        .goto_reference(doc.identifier(), pos, None)
+        .unwrap();
+
+    cx.callback(
+        future,
+        move |editor, compositor, response: Option<Vec<lsp::Location>>| {
+            let items = response.unwrap_or_default();
+            goto_impl(editor, compositor, items, offset_encoding);
+        },
+    );
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -1072,19 +1161,15 @@ pub fn signature_help_impl(cx: &mut Context, invoked: SignatureHelpInvoked) {
             language_server.text_document_signature_help(doc.identifier(), pos, None)
         });
 
-    let future = match future {
-        Some(future) => future.boxed(),
-        None => {
-            // Do not show the message if signature help was invoked
-            // automatically on backspace, trigger characters, etc.
-            if invoked == SignatureHelpInvoked::Manual {
-                cx.editor
-                    .set_error("No language server supports signature-help");
-            }
-            return;
+    let Some(future) = future else {
+        // Do not show the message if signature help was invoked
+        // automatically on backspace, trigger characters, etc.
+        if invoked == SignatureHelpInvoked::Manual {
+            cx.editor.set_error("No configured language server supports signature-help");
         }
+        return;
     };
-    signature_help_impl_with_future(cx, future, invoked);
+    signature_help_impl_with_future(cx, future.boxed(), invoked);
 }
 
 pub fn signature_help_impl_with_future(
@@ -1295,32 +1380,26 @@ pub fn rename_symbol(cx: &mut Context) {
                     return;
                 }
                 let (view, doc) = current!(cx.editor);
-                let request = doc
-                    .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
-                    .find_map(|language_server| {
-                        if let Some(language_server_id) = language_server_id {
-                            if language_server.id() != language_server_id {
-                                return None;
-                            }
-                        }
-                        let offset_encoding = language_server.offset_encoding();
-                        let pos = doc.position(view.id, offset_encoding);
-                        let future = language_server.rename_symbol(
-                            doc.identifier(),
-                            pos,
-                            input.to_string(),
-                        )?;
-                        Some((future, offset_encoding))
-                    });
 
-                if let Some((future, offset_encoding)) = request {
-                    match block_on(future) {
-                        Ok(edits) => apply_workspace_edit(cx.editor, offset_encoding, &edits),
-                        Err(err) => cx.editor.set_error(err.to_string()),
+                let Some(language_server) = doc
+                    .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
+                    .find(|ls| language_server_id.is_none() || Some(ls.id()) == language_server_id)
+                else {
+                    cx.editor.set_error("No configured language server supports symbol renaming");
+                    return;
+                };
+
+                let offset_encoding = language_server.offset_encoding();
+                let pos = doc.position(view.id, offset_encoding);
+                let future = language_server
+                    .rename_symbol(doc.identifier(), pos, input.to_string())
+                    .unwrap();
+
+                match block_on(future) {
+                    Ok(edits) => {
+                        let _ = apply_workspace_edit(cx.editor, offset_encoding, &edits);
                     }
-                } else {
-                    cx.editor
-                        .set_error("No language server supports symbol renaming");
+                    Err(err) => cx.editor.set_error(err.to_string()),
                 }
             },
         )
@@ -1329,20 +1408,28 @@ pub fn rename_symbol(cx: &mut Context) {
         Box::new(prompt)
     }
 
-    let (view, doc) = current!(cx.editor);
+    let (view, doc) = current_ref!(cx.editor);
 
-    let prepare_rename_request = doc
+    let language_server_with_prepare_rename_support = doc
         .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
-        .find_map(|language_server| {
-            let offset_encoding = language_server.offset_encoding();
-            let pos = doc.position(view.id, offset_encoding);
-            let future = language_server.prepare_rename(doc.identifier(), pos)?;
-            Some((future, offset_encoding, language_server.id()))
+        .find(|ls| {
+            matches!(
+                ls.capabilities().rename_provider,
+                Some(lsp::OneOf::Right(lsp::RenameOptions {
+                    prepare_provider: Some(true),
+                    ..
+                }))
+            )
         });
 
-    match prepare_rename_request {
-        // Language server supports textDocument/prepareRename, use it.
-        Some((future, offset_encoding, ls_id)) => cx.callback(
+    if let Some(language_server) = language_server_with_prepare_rename_support {
+        let ls_id = language_server.id();
+        let offset_encoding = language_server.offset_encoding();
+        let pos = doc.position(view.id, offset_encoding);
+        let future = language_server
+            .prepare_rename(doc.identifier(), pos)
+            .unwrap();
+        cx.callback(
             future,
             move |editor, compositor, response: Option<lsp::PrepareRenameResponse>| {
                 let prefill = match get_prefill_from_lsp_response(editor, offset_encoding, response)
@@ -1358,38 +1445,23 @@ pub fn rename_symbol(cx: &mut Context) {
 
                 compositor.push(prompt);
             },
-        ),
-        // Language server does not support textDocument/prepareRename, fall back
-        // to word boundary selection.
-        None => {
-            let prefill = get_prefill_from_word_boundary(cx.editor);
-
-            let prompt = create_rename_prompt(cx.editor, prefill, None);
-
-            cx.push_layer(prompt);
-        }
-    };
+        );
+    } else {
+        let prefill = get_prefill_from_word_boundary(cx.editor);
+        let prompt = create_rename_prompt(cx.editor, prefill, None);
+        cx.push_layer(prompt);
+    }
 }
 
 pub fn select_references_to_symbol_under_cursor(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    let future_offset_encoding = doc
-        .language_servers_with_feature(LanguageServerFeature::DocumentHighlight)
-        .find_map(|language_server| {
-            let offset_encoding = language_server.offset_encoding();
-            let pos = doc.position(view.id, offset_encoding);
-            let future =
-                language_server.text_document_document_highlight(doc.identifier(), pos, None)?;
-            Some((future, offset_encoding))
-        });
-    let (future, offset_encoding) = match future_offset_encoding {
-        Some(future_offset_encoding) => future_offset_encoding,
-        None => {
-            cx.editor
-                .set_error("No language server supports document-highlight");
-            return;
-        }
-    };
+    let language_server =
+        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::DocumentHighlight);
+    let offset_encoding = language_server.offset_encoding();
+    let pos = doc.position(view.id, offset_encoding);
+    let future = language_server
+        .text_document_document_highlight(doc.identifier(), pos, None)
+        .unwrap();
 
     cx.callback(
         future,
@@ -1444,16 +1516,9 @@ fn compute_inlay_hints_for_view(
     let view_id = view.id;
     let doc_id = view.doc;
 
-    let mut language_servers = doc.language_servers_with_feature(LanguageServerFeature::InlayHints);
-    let language_server = language_servers.find(|language_server| {
-        matches!(
-            language_server.capabilities().inlay_hint_provider,
-            Some(
-                lsp::OneOf::Left(true)
-                    | lsp::OneOf::Right(lsp::InlayHintServerCapabilities::Options(_))
-            )
-        )
-    })?;
+    let language_server = doc
+        .language_servers_with_feature(LanguageServerFeature::InlayHints)
+        .next()?;
 
     let doc_text = doc.text();
     let len_lines = doc_text.len_lines();

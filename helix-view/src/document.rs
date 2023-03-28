@@ -164,8 +164,8 @@ pub struct Document {
     version: i32, // should be usize?
     pub(crate) modified_since_accessed: bool,
 
-    diagnostics: Vec<Diagnostic>,
-    language_servers: Vec<Arc<helix_lsp::Client>>,
+    pub(crate) diagnostics: Vec<Diagnostic>,
+    pub(crate) language_servers: HashMap<LanguageServerName, Arc<Client>>,
 
     diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
@@ -457,7 +457,7 @@ where
     *mut_ref = f(mem::take(mut_ref));
 }
 
-use helix_lsp::{lsp, Client, OffsetEncoding};
+use helix_lsp::{lsp, Client, LanguageServerName};
 use url::Url;
 
 impl Document {
@@ -492,7 +492,7 @@ impl Document {
             last_saved_time: SystemTime::now(),
             last_saved_revision: 0,
             modified_since_accessed: false,
-            language_servers: Vec::new(),
+            language_servers: HashMap::new(),
             diff_handle: None,
             config,
             version_control_head: None,
@@ -607,21 +607,19 @@ impl Document {
 
         let text = self.text.clone();
         // finds first language server that supports formatting and then formats
-        let (offset_encoding, request) = self
+        let language_server = self
             .language_servers_with_feature(LanguageServerFeature::Format)
-            .find_map(|language_server| {
-                let offset_encoding = language_server.offset_encoding();
-                let request = language_server.text_document_formatting(
-                    self.identifier(),
-                    lsp::FormattingOptions {
-                        tab_size: self.tab_width() as u32,
-                        insert_spaces: matches!(self.indent_style, IndentStyle::Spaces(_)),
-                        ..Default::default()
-                    },
-                    None,
-                )?;
-                Some((offset_encoding, request))
-            })?;
+            .next()?;
+        let offset_encoding = language_server.offset_encoding();
+        let request = language_server.text_document_formatting(
+            self.identifier(),
+            lsp::FormattingOptions {
+                tab_size: self.tab_width() as u32,
+                insert_spaces: matches!(self.indent_style, IndentStyle::Spaces(_)),
+                ..Default::default()
+            },
+            None,
+        )?;
 
         let fut = async move {
             let edits = request.await.unwrap_or_else(|e| {
@@ -726,7 +724,7 @@ impl Document {
                 text: text.clone(),
             };
 
-            for language_server in language_servers {
+            for (_, language_server) in language_servers {
                 if !language_server.is_initialized() {
                     return Ok(event);
                 }
@@ -778,7 +776,7 @@ impl Document {
         let path = self
             .path()
             .filter(|path| path.exists())
-            .ok_or_else(|| anyhow!("can't find file to reload from"))?
+            .ok_or_else(|| anyhow!("can't find file to reload from {:?}", self.display_name()))?
             .to_owned();
 
         let mut file = std::fs::File::open(&path)?;
@@ -870,11 +868,6 @@ impl Document {
             .ok_or_else(|| anyhow!("invalid language id: {}", language_id))?;
         self.set_language(Some(language_config), Some(config_loader));
         Ok(())
-    }
-
-    /// Set the LSP.
-    pub fn set_language_servers(&mut self, language_servers: Vec<Arc<helix_lsp::Client>>) {
-        self.language_servers = language_servers;
     }
 
     /// Select text within the [`Document`].
@@ -1256,45 +1249,45 @@ impl Document {
         self.version
     }
 
+    /// maintains the order as configured in the language_servers TOML array
     pub fn language_servers(&self) -> impl Iterator<Item = &helix_lsp::Client> {
-        self.language_servers
-            .iter()
-            .filter_map(|l| if l.is_initialized() { Some(&**l) } else { None })
+        self.language_config().into_iter().flat_map(move |config| {
+            config.language_servers.iter().filter_map(move |features| {
+                let ls = &**self.language_servers.get(&features.name)?;
+                if ls.is_initialized() {
+                    Some(ls)
+                } else {
+                    None
+                }
+            })
+        })
     }
 
-    // TODO filter also based on LSP capabilities?
+    pub fn remove_language_server_by_name(&mut self, name: &str) -> Option<Arc<Client>> {
+        self.language_servers.remove(name)
+    }
+
     pub fn language_servers_with_feature(
         &self,
         feature: LanguageServerFeature,
     ) -> impl Iterator<Item = &helix_lsp::Client> {
-        self.language_servers().filter(move |server| {
-            self.language_config()
-                .and_then(|config| config.language_servers.get(server.name()))
-                .map_or(false, |server_features| {
-                    server_features.has_feature(feature)
-                })
+        self.language_config().into_iter().flat_map(move |config| {
+            config.language_servers.iter().filter_map(move |features| {
+                let ls = &**self.language_servers.get(&features.name)?;
+                if ls.is_initialized()
+                    && ls.supports_feature(feature)
+                    && features.has_feature(feature)
+                {
+                    Some(ls)
+                } else {
+                    None
+                }
+            })
         })
     }
 
     pub fn supports_language_server(&self, id: usize) -> bool {
         self.language_servers().any(|l| l.id() == id)
-    }
-
-    pub fn run_on_first_supported_language_server<T, P>(
-        &self,
-        view_id: ViewId,
-        feature: LanguageServerFeature,
-        request_provider: P,
-    ) -> Option<T>
-    where
-        P: Fn(&Client, OffsetEncoding, lsp::Position, lsp::TextDocumentIdentifier) -> Option<T>,
-    {
-        self.language_servers_with_feature(feature)
-            .find_map(|language_server| {
-                let offset_encoding = language_server.offset_encoding();
-                let pos = self.position(view_id, offset_encoding);
-                request_provider(language_server, offset_encoding, pos, self.identifier())
-            })
     }
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
@@ -1419,14 +1412,8 @@ impl Document {
 
     pub fn shown_diagnostics(&self) -> impl Iterator<Item = &Diagnostic> + DoubleEndedIterator {
         self.diagnostics.iter().filter(|d| {
-            self.language_servers()
-                .find(|ls| ls.id() == d.language_server_id)
-                .and_then(|ls| {
-                    let config = self.language_config()?;
-                    let features = config.language_servers.get(ls.name())?;
-                    Some(features.has_feature(LanguageServerFeature::Diagnostics))
-                })
-                == Some(true)
+            self.language_servers_with_feature(LanguageServerFeature::Diagnostics)
+                .any(|ls| ls.id() == d.language_server_id)
         })
     }
 
