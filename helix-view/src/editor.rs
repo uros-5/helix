@@ -10,6 +10,7 @@ use crate::{
     view::ViewPosition,
     Align, Document, DocumentId, View, ViewId,
 };
+use dap::StackFrame;
 use helix_vcs::DiffProviderRegistry;
 
 use futures_util::stream::select_all::SelectAll;
@@ -281,6 +282,8 @@ pub struct Config {
     /// Whether to color modes with different colors. Defaults to `false`.
     pub color_modes: bool,
     pub soft_wrap: SoftWrap,
+    /// Workspace specific lsp ceiling dirs
+    pub workspace_lsp_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,6 +352,10 @@ pub struct LspConfig {
     pub display_signature_help_docs: bool,
     /// Display inlay hints
     pub display_inlay_hints: bool,
+    /// Whether to enable snippet support
+    pub snippets: bool,
+    /// Whether to include declaration in the goto reference query
+    pub goto_reference_include_declaration: bool,
 }
 
 impl Default for LspConfig {
@@ -359,6 +366,8 @@ impl Default for LspConfig {
             auto_signature_help: true,
             display_signature_help_docs: true,
             display_inlay_hints: false,
+            snippets: true,
+            goto_reference_include_declaration: true,
         }
     }
 }
@@ -532,21 +541,16 @@ impl Default for CursorShapeConfig {
 }
 
 /// bufferline render modes
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BufferLine {
     /// Don't render bufferline
+    #[default]
     Never,
     /// Always render
     Always,
     /// Only if multiple buffers are open
     Multiple,
-}
-
-impl Default for BufferLine {
-    fn default() -> Self {
-        BufferLine::Never
-    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -748,9 +752,13 @@ impl Default for Config {
             bufferline: BufferLine::default(),
             indent_guides: IndentGuidesConfig::default(),
             color_modes: false,
-            soft_wrap: SoftWrap::default(),
+            soft_wrap: SoftWrap {
+                enable: Some(false),
+                ..SoftWrap::default()
+            },
             text_width: 80,
             completion_replace: false,
+            workspace_lsp_roots: Vec::new(),
         }
     }
 }
@@ -849,7 +857,7 @@ pub struct Editor {
     pub config_events: (UnboundedSender<ConfigEvent>, UnboundedReceiver<ConfigEvent>),
     /// Allows asynchronous tasks to control the rendering
     /// The `Notify` allows asynchronous tasks to request the editor to perform a redraw
-    /// The `RwLock` blocks the editor from performing the render until an exclusive lock can be aquired
+    /// The `RwLock` blocks the editor from performing the render until an exclusive lock can be acquired
     pub redraw_handle: RedrawHandle,
     pub needs_redraw: bool,
     /// Cached position of the cursor calculated during rendering.
@@ -866,7 +874,7 @@ pub struct Editor {
     /// times during rendering and should not be set by other functions.
     pub cursor_cache: Cell<Option<Option<Position>>>,
     /// When a new completion request is sent to the server old
-    /// unifinished request must be dropped. Each completion
+    /// unfinished request must be dropped. Each completion
     /// request is associated with a channel that cancels
     /// when the channel is dropped. That channel is stored
     /// here. When a new completion request is sent this
@@ -1080,6 +1088,11 @@ impl Editor {
         self._refresh();
     }
 
+    #[inline]
+    pub fn language_server_by_id(&self, language_server_id: usize) -> Option<&helix_lsp::Client> {
+        self.language_servers.get_by_id(language_server_id)
+    }
+
     /// Refreshes the language server for a given document
     pub fn refresh_language_servers(&mut self, doc_id: DocumentId) -> Option<()> {
         self.launch_language_servers(doc_id)
@@ -1090,14 +1103,17 @@ impl Editor {
         if !self.config().lsp.enable {
             return None;
         }
-        let doc = self.documents.get_mut(&doc_id)?;
         // if doc doesn't have a URL it's a scratch buffer, ignore it
+        let doc = self.documents.get_mut(&doc_id)?;
         let doc_url = doc.url()?;
+        let (lang, path) = (doc.language.clone(), doc.path().cloned());
+        let config = doc.config.load();
+        let root_dirs = &config.workspace_lsp_roots;
 
         // try to find language servers based on the language name
-        let language_servers = doc.language.as_ref().and_then(|language| {
+        let language_servers = lang.as_ref().and_then(|language| {
             self.language_servers
-                .get(language, doc.path())
+                .get(language, path.as_ref(), root_dirs, config.lsp.snippets)
                 .map_err(|e| {
                     log::error!(
                         "Failed to initialize the language servers for `{}` {{ {} }}",
@@ -1115,8 +1131,9 @@ impl Editor {
 
             let doc_language_servers_not_in_registry =
                 doc.language_servers.iter().filter(|(name, doc_ls)| {
-                    !language_servers.contains_key(*name)
-                        || language_servers[*name].id() != doc_ls.id()
+                    language_servers
+                        .get(*name)
+                        .map_or(true, |ls| ls.id() != doc_ls.id())
                 });
 
             for (_, language_server) in doc_language_servers_not_in_registry {
@@ -1124,8 +1141,9 @@ impl Editor {
             }
 
             let language_servers_not_in_doc = language_servers.iter().filter(|(name, ls)| {
-                !doc.language_servers.contains_key(*name)
-                    || doc.language_servers[*name].id() != ls.id()
+                doc.language_servers
+                    .get(*name)
+                    .map_or(true, |doc_ls| ls.id() != doc_ls.id())
             });
 
             for (_, language_server) in language_servers_not_in_doc {
@@ -1174,6 +1192,7 @@ impl Editor {
         let doc = doc_mut!(self, &doc_id);
         doc.ensure_view_init(view.id);
         view.sync_changes(doc);
+        doc.mark_as_focused();
 
         align_view(doc, view, Align::Center);
     }
@@ -1244,6 +1263,7 @@ impl Editor {
                 let view_id = view!(self).id;
                 let doc = doc_mut!(self, &id);
                 doc.ensure_view_init(view_id);
+                doc.mark_as_focused();
                 return;
             }
             Action::HorizontalSplit | Action::VerticalSplit => {
@@ -1265,6 +1285,7 @@ impl Editor {
                 // initialize selection for view
                 let doc = doc_mut!(self, &id);
                 doc.ensure_view_init(view_id);
+                doc.mark_as_focused();
             }
         }
 
@@ -1328,7 +1349,7 @@ impl Editor {
             doc.set_version_control_head(self.diff_providers.get_current_head_name(&path));
 
             let id = self.new_document(doc);
-            self.launch_language_servers(id);
+            let _ = self.launch_language_servers(id);
 
             id
         };
@@ -1415,6 +1436,7 @@ impl Editor {
             let view_id = self.tree.insert(view);
             let doc = doc_mut!(self, &doc_id);
             doc.ensure_view_init(view_id);
+            doc.mark_as_focused();
         }
 
         self._refresh();
@@ -1469,6 +1491,10 @@ impl Editor {
                 view.sync_changes(doc);
             }
         }
+
+        let view = view!(self, view_id);
+        let doc = doc_mut!(self, &view.doc);
+        doc.mark_as_focused();
     }
 
     pub fn focus_next(&mut self) {
@@ -1662,6 +1688,12 @@ impl Editor {
             doc.set_selection(view.id, selection);
             doc.restore_cursor = false;
         }
+    }
+
+    pub fn current_stack_frame(&self) -> Option<&StackFrame> {
+        self.debugger
+            .as_ref()
+            .and_then(|debugger| debugger.current_stack_frame())
     }
 }
 

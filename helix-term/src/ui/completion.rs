@@ -142,16 +142,12 @@ impl Completion {
                         }
                     };
 
-                    let start_offset =
-                        match util::lsp_pos_to_pos(doc.text(), edit.range.start, offset_encoding) {
-                            Some(start) => start as i128 - primary_cursor as i128,
-                            None => return Transaction::new(doc.text()),
-                        };
-                    let end_offset =
-                        match util::lsp_pos_to_pos(doc.text(), edit.range.end, offset_encoding) {
-                            Some(end) => end as i128 - primary_cursor as i128,
-                            None => return Transaction::new(doc.text()),
-                        };
+                    let Some(range) = util::lsp_range_to_range(doc.text(), edit.range, offset_encoding) else{
+                        return Transaction::new(doc.text());
+                    };
+
+                    let start_offset = range.anchor as i128 - primary_cursor as i128;
+                    let end_offset = range.head as i128 - primary_cursor as i128;
 
                     (Some((start_offset, end_offset)), edit.new_text)
                 } else {
@@ -218,6 +214,23 @@ impl Completion {
             // if more text was entered, remove it
             doc.restore(view, &savepoint);
 
+            macro_rules! language_server {
+                ($item:expr) => {
+                    match editor
+                        .language_servers
+                        .get_by_id($item.language_server_id)
+                    {
+                        Some(ls) => ls,
+                        None => {
+                            editor.set_error("completions are outdated");
+                            // TODO close the completion menu somehow,
+                            // currently there is no trivial way to access the EditorView to close the completion menu
+                            return;
+                        }
+                    }
+                };
+            }
+
             match event {
                 PromptEvent::Abort => {
                     editor.last_completion = None;
@@ -226,17 +239,11 @@ impl Completion {
                     // always present here
                     let item = item.unwrap();
 
-                    let offset_encoding = editor
-                        .language_servers
-                        .get_by_id(item.language_server_id)
-                        .expect("language server disappeared between completion request and application")
-                        .offset_encoding();
-
                     let transaction = item_to_transaction(
                         doc,
                         view.id,
                         item,
-                        offset_encoding,
+                        language_server!(item).offset_encoding(),
                         trigger_offset,
                         true,
                         replace_mode,
@@ -254,11 +261,8 @@ impl Completion {
                     // always present here
                     let item = item.unwrap();
 
-                    let offset_encoding = editor
-                        .language_servers
-                        .get_by_id(item.language_server_id)
-                        .expect("language server disappeared between completion request and application")
-                        .offset_encoding();
+                    let language_server = language_server!(item);
+                    let offset_encoding = language_server.offset_encoding();
 
                     let transaction = item_to_transaction(
                         doc,
@@ -287,10 +291,6 @@ impl Completion {
                     {
                         None
                     } else {
-                        let language_server = editor
-                            .language_servers
-                            .get_by_id(item.language_server_id)
-                            .unwrap();
                         Self::resolve_completion_item(language_server, item.lsp_item.clone())
                     };
 
@@ -403,16 +403,10 @@ impl Completion {
             _ => return false,
         };
 
-        let language_server = match cx.editor.language_servers.get_by_id(ls_id) {
-            Some(language_server) => language_server,
-            None => return false,
-        };
+        let Some(language_server) = cx.editor.language_server_by_id(ls_id) else { return false; };
 
         // This method should not block the compositor so we handle the response asynchronously.
-        let future = match language_server.resolve_completion_item(current_item.clone()) {
-            Some(future) => future,
-            None => return false,
-        };
+        let Some(future) = language_server.resolve_completion_item(current_item.clone()) else { return false; };
 
         cx.callback(
             future,
@@ -441,6 +435,10 @@ impl Completion {
         );
 
         true
+    }
+
+    pub fn area(&mut self, viewport: Rect, editor: &Editor) -> Rect {
+        self.popup.area(viewport, editor)
     }
 }
 
@@ -511,7 +509,7 @@ impl Component for Completion {
         };
 
         let popup_area = {
-            let (popup_x, popup_y) = self.popup.get_rel_position(area, cx);
+            let (popup_x, popup_y) = self.popup.get_rel_position(area, cx.editor);
             let (popup_width, popup_height) = self.popup.get_size();
             Rect::new(popup_x, popup_y, popup_width, popup_height)
         };

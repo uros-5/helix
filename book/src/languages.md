@@ -67,7 +67,8 @@ These configuration keys are available:
 | `config`              | Language Server configuration                                 |
 | `grammar`             | The tree-sitter grammar to use (defaults to the value of `name`) |
 | `formatter`           | The formatter for the language, it will take precedence over the lsp when defined. The formatter must be able to take the original file as input from stdin and write the formatted file to stdout |
-| `text-width`          |  Maximum line length. Used for the `:reflow` command and soft-wrapping if `soft-wrap.wrap_at_text_width` is set, defaults to `editor.text-width`   |
+| `text-width`          |  Maximum line length. Used for the `:reflow` command and soft-wrapping if `soft-wrap.wrap-at-text-width` is set, defaults to `editor.text-width`   |
+| `workspace-lsp-roots`     | Directories relative to the workspace root that are treated as LSP roots. Should only be set in `.helix/config.toml`. Overwrites the setting of the same name in `config.toml` if set. |
 
 ### File-type detection and the `file-types` key
 
@@ -167,6 +168,7 @@ language-servers = [ { name = "typescript-language-server", except-features = [ 
 
 Each requested LSP feature is prioritized in the order of the `language-servers` array.
 For example the first `goto-definition` supported language server (in this case `typescript-language-server`) will be taken for the relevant LSP request (command `goto_definition`).
+The features `diagnostics`, `code-action`, `completion`, `document-symbols` and `workspace-symbols` are an exception to that rule, as they are working for all language servers at the same time and are merged together, if enabled for the language.
 If no `except-features` or `only-features` is given all features for the language server are enabled.
 If a language server itself doesn't support a feature the next language server array entry will be tried (and so on).
 

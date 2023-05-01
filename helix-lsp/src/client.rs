@@ -1,22 +1,26 @@
 use crate::{
-    jsonrpc,
+    find_lsp_workspace, jsonrpc,
     transport::{Payload, Transport},
     Call, Error, OffsetEncoding, Result,
 };
 
-use helix_core::{find_root, syntax::LanguageServerFeature, ChangeSet, Rope};
+use helix_core::{find_workspace, path, syntax::LanguageServerFeature, ChangeSet, Rope};
 use helix_loader::{self, VERSION_AND_GIT_HASH};
-use lsp::PositionEncodingKind;
+use lsp::{
+    notification::DidChangeWorkspaceFolders, DidChangeWorkspaceFoldersParams, OneOf,
+    PositionEncodingKind, WorkspaceFolder, WorkspaceFoldersChangeEvent,
+};
 use lsp_types as lsp;
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::future::Future;
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use std::{collections::HashMap, path::PathBuf};
 use tokio::{
     io::{BufReader, BufWriter},
     process::{Child, Command},
@@ -25,6 +29,17 @@ use tokio::{
         Notify, OnceCell,
     },
 };
+
+fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
+    lsp::WorkspaceFolder {
+        name: uri
+            .path_segments()
+            .and_then(|segments| segments.last())
+            .map(|basename| basename.to_string())
+            .unwrap_or_default(),
+        uri,
+    }
+}
 
 #[derive(Debug)]
 pub struct Client {
@@ -37,11 +52,121 @@ pub struct Client {
     config: Option<Value>,
     root_path: std::path::PathBuf,
     root_uri: Option<lsp::Url>,
-    workspace_folders: Vec<lsp::WorkspaceFolder>,
+    workspace_folders: Mutex<Vec<lsp::WorkspaceFolder>>,
+    initialize_notify: Arc<Notify>,
+    /// workspace folders added while the server is still initializing
     req_timeout: u64,
 }
 
 impl Client {
+    pub fn try_add_doc(
+        self: &Arc<Self>,
+        root_markers: &[String],
+        manual_roots: &[PathBuf],
+        doc_path: Option<&std::path::PathBuf>,
+        may_support_workspace: bool,
+    ) -> bool {
+        let (workspace, workspace_is_cwd) = find_workspace();
+        let workspace = path::get_normalized_path(&workspace);
+        let root = find_lsp_workspace(
+            doc_path
+                .and_then(|x| x.parent().and_then(|x| x.to_str()))
+                .unwrap_or("."),
+            root_markers,
+            manual_roots,
+            &workspace,
+            workspace_is_cwd,
+        );
+        let root_uri = root
+            .as_ref()
+            .and_then(|root| lsp::Url::from_file_path(root).ok());
+
+        if self.root_path == root.unwrap_or(workspace)
+            || root_uri.as_ref().map_or(false, |root_uri| {
+                self.workspace_folders
+                    .lock()
+                    .iter()
+                    .any(|workspace| &workspace.uri == root_uri)
+            })
+        {
+            // workspace URI is already registered so we can use this client
+            return true;
+        }
+
+        // this server definitely doesn't support multiple workspace, no need to check capabilities
+        if !may_support_workspace {
+            return false;
+        }
+
+        let Some(capabilities) = self.capabilities.get() else {
+            let client = Arc::clone(self);
+            // initialization hasn't finished yet, deal with this new root later
+            // TODO: In the edgecase that a **new root** is added
+            // for an LSP that **doesn't support workspace_folders** before initaliation is finished
+            // the new roots are ignored.
+            // That particular edgecase would require retroactively spawning new LSP
+            // clients and therefore also require us to retroactively update the corresponding
+            // documents LSP client handle. It's doable but a pretty weird edgecase so let's
+            // wait and see if anyone ever runs into it.
+            tokio::spawn(async move {
+                client.initialize_notify.notified().await;
+                if let Some(workspace_folders_caps) = client
+                    .capabilities()
+                    .workspace
+                    .as_ref()
+                    .and_then(|cap| cap.workspace_folders.as_ref())
+                    .filter(|cap| cap.supported.unwrap_or(false))
+                {
+                    client.add_workspace_folder(
+                        root_uri,
+                        &workspace_folders_caps.change_notifications,
+                    );
+                }
+            });
+            return true;
+        };
+
+        if let Some(workspace_folders_caps) = capabilities
+            .workspace
+            .as_ref()
+            .and_then(|cap| cap.workspace_folders.as_ref())
+            .filter(|cap| cap.supported.unwrap_or(false))
+        {
+            self.add_workspace_folder(root_uri, &workspace_folders_caps.change_notifications);
+            true
+        } else {
+            // the server doesn't support multi workspaces, we need a new client
+            false
+        }
+    }
+
+    fn add_workspace_folder(
+        &self,
+        root_uri: Option<lsp::Url>,
+        change_notifications: &Option<OneOf<bool, String>>,
+    ) {
+        // root_uri is None just means that there isn't really any LSP workspace
+        // associated with this file. For servers that support multiple workspaces
+        // there is just one server so we can always just use that shared instance.
+        // No need to add a new workspace root here as there is no logical root for this file
+        // let the server deal with this
+        let Some(root_uri) = root_uri else {
+            return;
+        };
+
+        // server supports workspace folders, let's add the new root to the list
+        self.workspace_folders
+            .lock()
+            .push(workspace_for_uri(root_uri.clone()));
+        if &Some(OneOf::Left(false)) == change_notifications {
+            // server specifically opted out of DidWorkspaceChange notifications
+            // let's assume the server will request the workspace folders itself
+            // and that we can therefore reuse the client (but are done now)
+            return;
+        }
+        tokio::spawn(self.did_change_workspace(vec![workspace_for_uri(root_uri)], Vec::new()));
+    }
+
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn start(
         cmd: &str,
@@ -49,6 +174,7 @@ impl Client {
         config: Option<Value>,
         server_environment: HashMap<String, String>,
         root_markers: &[String],
+        manual_roots: &[PathBuf],
         id: usize,
         name: String,
         req_timeout: u64,
@@ -76,27 +202,26 @@ impl Client {
 
         let (server_rx, server_tx, initialize_notify) =
             Transport::start(reader, writer, stderr, id, name.clone());
-
-        let root_path = find_root(
-            doc_path.and_then(|x| x.parent().and_then(|x| x.to_str())),
+        let (workspace, workspace_is_cwd) = find_workspace();
+        let workspace = path::get_normalized_path(&workspace);
+        let root = find_lsp_workspace(
+            doc_path
+                .and_then(|x| x.parent().and_then(|x| x.to_str()))
+                .unwrap_or("."),
             root_markers,
+            manual_roots,
+            &workspace,
+            workspace_is_cwd,
         );
 
-        let root_uri = lsp::Url::from_file_path(root_path.clone()).ok();
+        // `root_uri` and `workspace_folder` can be empty in case there is no workspace
+        // `root_url` can not, use `workspace` as a fallback
+        let root_path = root.clone().unwrap_or_else(|| workspace.clone());
+        let root_uri = root.and_then(|root| lsp::Url::from_file_path(root).ok());
 
-        // TODO: support multiple workspace folders
         let workspace_folders = root_uri
             .clone()
-            .map(|root| {
-                vec![lsp::WorkspaceFolder {
-                    name: root
-                        .path_segments()
-                        .and_then(|segments| segments.last())
-                        .map(|basename| basename.to_string())
-                        .unwrap_or_default(),
-                    uri: root,
-                }]
-            })
+            .map(|root| vec![workspace_for_uri(root)])
             .unwrap_or_default();
 
         let client = Self {
@@ -108,10 +233,10 @@ impl Client {
             capabilities: OnceCell::new(),
             config,
             req_timeout,
-
             root_path,
             root_uri,
-            workspace_folders,
+            workspace_folders: Mutex::new(workspace_folders),
+            initialize_notify: initialize_notify.clone(),
         };
 
         Ok((client, server_rx, initialize_notify))
@@ -151,65 +276,62 @@ impl Client {
             .expect("language server not yet initialized!")
     }
 
-    #[inline] // TODO inline?
+    /// Client has to be initialized otherwise this function panics
+    #[inline]
     pub fn supports_feature(&self, feature: LanguageServerFeature) -> bool {
-        let capabilities = match self.capabilities.get() {
-            Some(capabilities) => capabilities,
-            None => return false, // not initialized, TODO unwrap/expect instead?
-        };
+        let capabilities = self.capabilities();
+
+        use lsp::*;
         match feature {
             LanguageServerFeature::Format => matches!(
                 capabilities.document_formatting_provider,
-                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+                Some(OneOf::Left(true) | OneOf::Right(_))
             ),
             LanguageServerFeature::GotoDeclaration => matches!(
                 capabilities.declaration_provider,
                 Some(
-                    lsp::DeclarationCapability::Simple(true)
-                        | lsp::DeclarationCapability::RegistrationOptions(_)
-                        | lsp::DeclarationCapability::Options(_),
+                    DeclarationCapability::Simple(true)
+                        | DeclarationCapability::RegistrationOptions(_)
+                        | DeclarationCapability::Options(_),
                 )
             ),
             LanguageServerFeature::GotoDefinition => matches!(
                 capabilities.definition_provider,
-                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+                Some(OneOf::Left(true) | OneOf::Right(_))
             ),
             LanguageServerFeature::GotoTypeDefinition => matches!(
                 capabilities.type_definition_provider,
                 Some(
-                    lsp::TypeDefinitionProviderCapability::Simple(true)
-                        | lsp::TypeDefinitionProviderCapability::Options(_),
+                    TypeDefinitionProviderCapability::Simple(true)
+                        | TypeDefinitionProviderCapability::Options(_),
                 )
             ),
             LanguageServerFeature::GotoReference => matches!(
                 capabilities.references_provider,
-                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+                Some(OneOf::Left(true) | OneOf::Right(_))
             ),
             LanguageServerFeature::GotoImplementation => matches!(
                 capabilities.implementation_provider,
                 Some(
-                    lsp::ImplementationProviderCapability::Simple(true)
-                        | lsp::ImplementationProviderCapability::Options(_),
+                    ImplementationProviderCapability::Simple(true)
+                        | ImplementationProviderCapability::Options(_),
                 )
             ),
             LanguageServerFeature::SignatureHelp => capabilities.signature_help_provider.is_some(),
             LanguageServerFeature::Hover => matches!(
                 capabilities.hover_provider,
-                Some(
-                    lsp::HoverProviderCapability::Simple(true)
-                        | lsp::HoverProviderCapability::Options(_),
-                )
+                Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_),)
             ),
             LanguageServerFeature::DocumentHighlight => matches!(
                 capabilities.document_highlight_provider,
-                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+                Some(OneOf::Left(true) | OneOf::Right(_))
             ),
             LanguageServerFeature::Completion => capabilities.completion_provider.is_some(),
             LanguageServerFeature::CodeAction => matches!(
                 capabilities.code_action_provider,
                 Some(
-                    lsp::CodeActionProviderCapability::Simple(true)
-                        | lsp::CodeActionProviderCapability::Options(_),
+                    CodeActionProviderCapability::Simple(true)
+                        | CodeActionProviderCapability::Options(_),
                 )
             ),
             LanguageServerFeature::WorkspaceCommand => {
@@ -217,23 +339,20 @@ impl Client {
             }
             LanguageServerFeature::DocumentSymbols => matches!(
                 capabilities.document_symbol_provider,
-                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+                Some(OneOf::Left(true) | OneOf::Right(_))
             ),
             LanguageServerFeature::WorkspaceSymbols => matches!(
                 capabilities.workspace_symbol_provider,
-                Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
+                Some(OneOf::Left(true) | OneOf::Right(_))
             ),
             LanguageServerFeature::Diagnostics => true, // there's no extra server capability
             LanguageServerFeature::RenameSymbol => matches!(
                 capabilities.rename_provider,
-                Some(lsp::OneOf::Left(true)) | Some(lsp::OneOf::Right(_))
+                Some(OneOf::Left(true)) | Some(OneOf::Right(_))
             ),
             LanguageServerFeature::InlayHints => matches!(
                 capabilities.inlay_hint_provider,
-                Some(
-                    lsp::OneOf::Left(true)
-                        | lsp::OneOf::Right(lsp::InlayHintServerCapabilities::Options(_))
-                )
+                Some(OneOf::Left(true) | OneOf::Right(InlayHintServerCapabilities::Options(_)))
             ),
         }
     }
@@ -247,7 +366,7 @@ impl Client {
                 "utf-16" => Some(OffsetEncoding::Utf16),
                 "utf-32" => Some(OffsetEncoding::Utf32),
                 encoding => {
-                    log::error!("Server provided invalid position encording {encoding}, defaulting to utf-16");
+                    log::error!("Server provided invalid position encoding {encoding}, defaulting to utf-16");
                     None
                 },
             })
@@ -258,8 +377,10 @@ impl Client {
         self.config.as_ref()
     }
 
-    pub fn workspace_folders(&self) -> &[lsp::WorkspaceFolder] {
-        &self.workspace_folders
+    pub async fn workspace_folders(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, Vec<lsp::WorkspaceFolder>> {
+        self.workspace_folders.lock()
     }
 
     /// Execute a RPC request on the language server.
@@ -379,7 +500,7 @@ impl Client {
     // General messages
     // -------------------------------------------------------------------------------------------
 
-    pub(crate) async fn initialize(&self) -> Result<lsp::InitializeResult> {
+    pub(crate) async fn initialize(&self, enable_snippets: bool) -> Result<lsp::InitializeResult> {
         if let Some(config) = &self.config {
             log::info!("Using custom LSP config: {}", config);
         }
@@ -387,7 +508,7 @@ impl Client {
         #[allow(deprecated)]
         let params = lsp::InitializeParams {
             process_id: Some(std::process::id()),
-            workspace_folders: Some(self.workspace_folders.clone()),
+            workspace_folders: Some(self.workspace_folders.lock().clone()),
             // root_path is obsolete, but some clients like pyright still use it so we specify both.
             // clients will prefer _uri if possible
             root_path: self.root_path.to_str().map(|path| path.to_owned()),
@@ -427,7 +548,7 @@ impl Client {
                 text_document: Some(lsp::TextDocumentClientCapabilities {
                     completion: Some(lsp::CompletionClientCapabilities {
                         completion_item: Some(lsp::CompletionItemCapability {
-                            snippet_support: Some(true),
+                            snippet_support: Some(enable_snippets),
                             resolve_support: Some(lsp::CompletionItemCapabilityResolveSupport {
                                 properties: vec![
                                     String::from("documentation"),
@@ -506,8 +627,8 @@ impl Client {
                 }),
                 general: Some(lsp::GeneralClientCapabilities {
                     position_encodings: Some(vec![
-                        PositionEncodingKind::UTF32,
                         PositionEncodingKind::UTF8,
+                        PositionEncodingKind::UTF32,
                         PositionEncodingKind::UTF16,
                     ]),
                     ..Default::default()
@@ -556,6 +677,16 @@ impl Client {
         self.notify::<lsp::notification::DidChangeConfiguration>(
             lsp::DidChangeConfigurationParams { settings },
         )
+    }
+
+    pub fn did_change_workspace(
+        &self,
+        added: Vec<WorkspaceFolder>,
+        removed: Vec<WorkspaceFolder>,
+    ) -> impl Future<Output = Result<()>> {
+        self.notify::<DidChangeWorkspaceFolders>(DidChangeWorkspaceFoldersParams {
+            event: WorkspaceFoldersChangeEvent { added, removed },
+        })
     }
 
     // -------------------------------------------------------------------------------------------
@@ -1123,6 +1254,7 @@ impl Client {
         &self,
         text_document: lsp::TextDocumentIdentifier,
         position: lsp::Position,
+        include_declaration: bool,
         work_done_token: Option<lsp::ProgressToken>,
     ) -> Option<impl Future<Output = Result<Value>>> {
         let capabilities = self.capabilities.get().unwrap();
@@ -1139,7 +1271,7 @@ impl Client {
                 position,
             },
             context: lsp::ReferenceContext {
-                include_declaration: true,
+                include_declaration,
             },
             work_done_progress_params: lsp::WorkDoneProgressParams { work_done_token },
             partial_result_params: lsp::PartialResultParams {

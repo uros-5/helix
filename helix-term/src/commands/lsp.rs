@@ -31,7 +31,7 @@ use crate::{
     compositor::{self, Compositor},
     job::Callback,
     ui::{
-        self, lsp::SignatureHelp, overlay::overlayed, DynamicPicker, FileLocation, FilePicker,
+        self, lsp::SignatureHelp, overlay::overlaid, DynamicPicker, FileLocation, FilePicker,
         Popup, PromptEvent,
     },
 };
@@ -95,7 +95,7 @@ impl ui::menu::Item for lsp::Location {
 
         // Most commonly, this will not allocate, especially on Unix systems where the root prefix
         // is a simple `/` and not `C:\` (with whatever drive letter)
-        write!(&mut res, ":{}", self.range.start.line)
+        write!(&mut res, ":{}", self.range.start.line + 1)
             .expect("Will only failed if allocating fail");
         res.into()
     }
@@ -230,7 +230,9 @@ fn jump_to_location(
             log::warn!("lsp position out of bounds - {:?}", location.range);
             return;
         };
-    doc.set_selection(view.id, Selection::single(new_range.anchor, new_range.head));
+    // we flip the range so that the cursor sits on the start of the symbol
+    // (for example start of the function).
+    doc.set_selection(view.id, Selection::single(new_range.head, new_range.anchor));
     align_view(doc, view, Align::Center);
 }
 
@@ -299,7 +301,7 @@ fn diag_picker(
         flat_diag.reserve(diags.len());
 
         for (diag, ls) in diags {
-            if let Some(ls) = cx.editor.language_servers.get_by_id(ls) {
+            if let Some(ls) = cx.editor.language_server_by_id(ls) {
                 flat_diag.push(PickerDiagnostic {
                     url: url.clone(),
                     diag,
@@ -431,7 +433,7 @@ pub fn symbol_picker(cx: &mut Context) {
         }
         let call = move |_editor: &mut Editor, compositor: &mut Compositor| {
             let picker = sym_picker(symbols, current_url);
-            compositor.push(Box::new(overlayed(picker)))
+            compositor.push(Box::new(overlaid(picker)))
         };
 
         Ok(Callback::EditorCompositor(Box::new(call)))
@@ -491,7 +493,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
         let call = move |_editor: &mut Editor, compositor: &mut Compositor| {
             let picker = sym_picker(symbols, current_url);
             let dyn_picker = DynamicPicker::new(picker, Box::new(get_symbols));
-            compositor.push(Box::new(overlayed(dyn_picker)))
+            compositor.push(Box::new(overlaid(dyn_picker)))
         };
 
         Ok(Callback::EditorCompositor(Box::new(call)))
@@ -513,7 +515,7 @@ pub fn diagnostics_picker(cx: &mut Context) {
             Some(current_url),
             DiagnosticsFormat::HideSourcePath,
         );
-        cx.push_layer(Box::new(overlayed(picker)));
+        cx.push_layer(Box::new(overlaid(picker)));
     }
 }
 
@@ -528,7 +530,7 @@ pub fn workspace_diagnostics_picker(cx: &mut Context) {
         current_url,
         DiagnosticsFormat::ShowSourcePath,
     );
-    cx.push_layer(Box::new(overlayed(picker)));
+    cx.push_layer(Box::new(overlaid(picker)));
 }
 
 struct CodeActionOrCommandItem {
@@ -553,7 +555,7 @@ impl ui::menu::Item for CodeActionOrCommandItem {
 ///
 /// While the `kind` field is defined as open ended in the LSP spec (any value may be used)
 /// in practice a closed set of common values (mostly suggested in the LSP spec) are used.
-/// VSCode displays each of these categories seperatly (seperated by a heading in the codeactions picker)
+/// VSCode displays each of these categories separately (separated by a heading in the codeactions picker)
 /// to make them easier to navigate. Helix does not display these  headings to the user.
 /// However it does sort code actions by their categories to achieve the same order as the VScode picker,
 /// just without the headings.
@@ -583,7 +585,7 @@ fn action_category(action: &CodeActionOrCommand) -> u32 {
     }
 }
 
-fn action_prefered(action: &CodeActionOrCommand) -> bool {
+fn action_preferred(action: &CodeActionOrCommand) -> bool {
     matches!(
         action,
         CodeActionOrCommand::CodeAction(CodeAction {
@@ -659,7 +661,7 @@ pub fn code_action(cx: &mut Context) {
             //
             // First the codeactions that fix some diagnostics are moved to the front.
             // If both codeactions fix some diagnostics (or both fix none) the codeaction
-            // that is marked with `is_preffered` is shown first. The codeactions are then shown in seperate
+            // that is marked with `is_preferred` is shown first. The codeactions are then shown in separate
             // submenus that only contain a certain category (see `action_category`) of actions.
             //
             // Below this done in in a single sorting step
@@ -681,10 +683,10 @@ pub fn code_action(cx: &mut Context) {
                     return order;
                 }
 
-                // if one of the codeactions is marked as prefered show it first
+                // if one of the codeactions is marked as preferred show it first
                 // otherwise keep the original LSP sorting
-                action_prefered(action1)
-                    .cmp(&action_prefered(action2))
+                action_preferred(action1)
+                    .cmp(&action_preferred(action2))
                     .reverse()
             });
 
@@ -723,7 +725,7 @@ pub fn code_action(cx: &mut Context) {
 
                 // always present here
                 let action = action.unwrap();
-                let Some(language_server) = editor.language_servers.get_by_id(action.language_server_id) else {
+                let Some(language_server) = editor.language_server_by_id(action.language_server_id) else {
                     editor.set_error("Language Server disappeared");
                     return;
                 };
@@ -770,8 +772,7 @@ pub fn execute_lsp_command(editor: &mut Editor, language_server_id: usize, cmd: 
     // the command is executed on the server and communicated back
     // to the client asynchronously using workspace edits
     let future = match editor
-        .language_servers
-        .get_by_id(language_server_id)
+        .language_server_by_id(language_server_id)
         .and_then(|language_server| language_server.command(cmd))
     {
         Some(future) => future,
@@ -1045,7 +1046,7 @@ fn goto_impl(
                 },
                 move |_editor, location| Some(location_to_file_location(location)),
             );
-            compositor.push(Box::new(overlayed(picker)));
+            compositor.push(Box::new(overlaid(picker)));
         }
     }
 }
@@ -1119,6 +1120,7 @@ pub fn goto_implementation(cx: &mut Context) {
 }
 
 pub fn goto_reference(cx: &mut Context) {
+    let config = cx.editor.config();
     let (view, doc) = current!(cx.editor);
 
     // TODO could probably support multiple language servers,
@@ -1128,7 +1130,12 @@ pub fn goto_reference(cx: &mut Context) {
     let offset_encoding = language_server.offset_encoding();
     let pos = doc.position(view.id, offset_encoding);
     let future = language_server
-        .goto_reference(doc.identifier(), pos, None)
+        .goto_reference(
+            doc.identifier(),
+            pos,
+            config.lsp.goto_reference_include_declaration,
+            None,
+        )
         .unwrap();
 
     cx.callback(
@@ -1257,10 +1264,25 @@ pub fn signature_help_impl_with_future(
             contents.set_active_param_range(active_param_range());
 
             let old_popup = compositor.find_id::<Popup<SignatureHelp>>(SignatureHelp::ID);
-            let popup = Popup::new(SignatureHelp::ID, contents)
+            let mut popup = Popup::new(SignatureHelp::ID, contents)
                 .position(old_popup.and_then(|p| p.get_position()))
                 .position_bias(Open::Above)
                 .ignore_escape_key(true);
+
+            // Don't create a popup if it intersects the auto-complete menu.
+            let size = compositor.size();
+            if compositor
+                .find::<ui::EditorView>()
+                .unwrap()
+                .completion
+                .as_mut()
+                .map(|completion| completion.area(size, editor))
+                .filter(|area| area.intersects(popup.area(size, editor)))
+                .is_some()
+            {
+                return;
+            }
+
             compositor.replace_or_push(SignatureHelp::ID, popup);
         },
     );
@@ -1383,7 +1405,7 @@ pub fn rename_symbol(cx: &mut Context) {
 
                 let Some(language_server) = doc
                     .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
-                    .find(|ls| language_server_id.is_none() || Some(ls.id()) == language_server_id)
+                    .find(|ls| language_server_id.map_or(true, |id| id == ls.id()))
                 else {
                     cx.editor.set_error("No configured language server supports symbol renaming");
                     return;
@@ -1528,7 +1550,7 @@ fn compute_inlay_hints_for_view(
     // than computing all the hints for the full file (which could be dozens of time
     // longer than the view is).
     let view_height = view.inner_height();
-    let first_visible_line = doc_text.char_to_line(view.offset.anchor);
+    let first_visible_line = doc_text.char_to_line(view.offset.anchor.min(doc_text.len_chars()));
     let first_line = first_visible_line.saturating_sub(view_height);
     let last_line = first_visible_line
         .saturating_add(view_height.saturating_mul(2))
