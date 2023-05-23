@@ -1290,54 +1290,65 @@ pub fn signature_help_impl_with_future(
 
 pub fn hover(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
+    let mut futures = vec![];
 
-    // TODO support multiple language servers (merge UI somehow)
-    let language_server =
-        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::Hover);
     // TODO: factor out a doc.position_identifier() that returns lsp::TextDocumentPositionIdentifier
-    let pos = doc.position(view.id, language_server.offset_encoding());
-    let future = language_server
-        .text_document_hover(doc.identifier(), pos, None)
-        .unwrap();
+    let requests = doc.language_servers_with_feature(LanguageServerFeature::Hover);
+    // .into_iter()
+    // .find_map(|language_server| {
+    //     let pos = doc.position(view.id, language_server.offset_encoding());
+    //     language_server.text_document_hover(doc.identifier(), pos, None)
+    // });
+    for language_server in requests {
+        let pos = doc.position(view.id, language_server.offset_encoding());
+        futures.push(language_server.text_document_hover(doc.identifier(), pos, None));
+    }
 
-    cx.callback(
-        future,
-        move |editor, compositor, response: Option<lsp::Hover>| {
-            if let Some(hover) = response {
-                // hover.contents / .range <- used for visualizing
+    if futures.is_empty() {
+        cx.editor.set_error("No language server supports hover");
+        return;
+    }
+    for future in futures.into_iter().flatten() {
+        cx.callback(
+            future,
+            move |editor, compositor, response: Option<lsp::Hover>| {
+                if let Some(hover) = response {
+                    // hover.contents / .range <- used for visualizing
 
-                fn marked_string_to_markdown(contents: lsp::MarkedString) -> String {
-                    match contents {
-                        lsp::MarkedString::String(contents) => contents,
-                        lsp::MarkedString::LanguageString(string) => {
-                            if string.language == "markdown" {
-                                string.value
-                            } else {
-                                format!("```{}\n{}\n```", string.language, string.value)
+                    fn marked_string_to_markdown(contents: lsp::MarkedString) -> String {
+                        match contents {
+                            lsp::MarkedString::String(contents) => contents,
+                            lsp::MarkedString::LanguageString(string) => {
+                                if string.language == "markdown" {
+                                    string.value
+                                } else {
+                                    format!("```{}\n{}\n```", string.language, string.value)
+                                }
                             }
                         }
                     }
+
+                    let contents = match hover.contents {
+                        lsp::HoverContents::Scalar(contents) => marked_string_to_markdown(contents),
+                        lsp::HoverContents::Array(contents) => contents
+                            .into_iter()
+                            .map(marked_string_to_markdown)
+                            .collect::<Vec<_>>()
+                            .join("\n\n"),
+                        lsp::HoverContents::Markup(contents) => contents.value,
+                    };
+
+                    // skip if contents empty
+
+                    let contents = ui::Markdown::new(contents, editor.syn_loader.clone());
+                    let popup = Popup::new("hover", contents).auto_close(true);
+                    compositor.replace_or_push("hover", popup);
                 }
-
-                let contents = match hover.contents {
-                    lsp::HoverContents::Scalar(contents) => marked_string_to_markdown(contents),
-                    lsp::HoverContents::Array(contents) => contents
-                        .into_iter()
-                        .map(marked_string_to_markdown)
-                        .collect::<Vec<_>>()
-                        .join("\n\n"),
-                    lsp::HoverContents::Markup(contents) => contents.value,
-                };
-
-                // skip if contents empty
-
-                let contents = ui::Markdown::new(contents, editor.syn_loader.clone());
-                let popup = Popup::new("hover", contents).auto_close(true);
-                compositor.replace_or_push("hover", popup);
-            }
-        },
-    );
+            },
+        );
+    }
 }
+
 
 pub fn rename_symbol(cx: &mut Context) {
     fn get_prefill_from_word_boundary(editor: &Editor) -> String {
