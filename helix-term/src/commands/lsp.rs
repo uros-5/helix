@@ -442,6 +442,15 @@ pub fn symbol_picker(cx: &mut Context) {
 
 pub fn workspace_symbol_picker(cx: &mut Context) {
     let doc = doc!(cx.editor);
+    if doc
+        .language_servers_with_feature(LanguageServerFeature::WorkspaceSymbols)
+        .count()
+        == 0
+    {
+        cx.editor
+            .set_error("No configured language server supports workspace symbols");
+        return;
+    }
 
     let get_symbols = move |pattern: String, editor: &mut Editor| {
         let doc = doc!(editor);
@@ -1495,7 +1504,7 @@ pub fn select_references_to_symbol_under_cursor(cx: &mut Context) {
             };
             let (view, doc) = current!(editor);
             let text = doc.text();
-            let pos = doc.selection(view.id).primary().head;
+            let pos = doc.selection(view.id).primary().cursor(text.slice(..));
 
             // We must find the range that contains our primary cursor to prevent our primary cursor to move
             let mut primary_index = 0;

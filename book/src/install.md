@@ -82,7 +82,10 @@ in the AUR, which builds the master branch.
 
 ### NixOS
 
-Helix is available as a [flake](https://nixos.wiki/wiki/Flakes) in the project
+Helix is available in [nixpkgs](https://github.com/nixos/nixpkgs) through the `helix` attribute,
+the unstable channel usually carries the latest release.
+
+Helix is also available as a [flake](https://nixos.wiki/wiki/Flakes) in the project
 root. Use `nix develop` to spin up a reproducible development shell. Outputs are
 cached for each push to master using [Cachix](https://www.cachix.org/). The
 flake is configured to automatically make use of this cache assuming the user
@@ -158,7 +161,7 @@ Requirements:
 
 - The [Rust toolchain](https://www.rust-lang.org/tools/install)
 - The [Git version control system](https://git-scm.com/)
-- A c++14 compatible compiler to build the tree-sitter grammars, for example GCC or Clang
+- A C++14 compatible compiler to build the tree-sitter grammars, for example GCC or Clang
 
 If you are using the `musl-libc` standard library instead of `glibc` the following environment variable must be set during the build to ensure tree-sitter grammars can be loaded correctly:
 
@@ -201,8 +204,10 @@ HELIX_RUNTIME=/home/user-name/src/helix/runtime
 Or, create a symlink in `~/.config/helix` that links to the source code directory:
 
 ```sh
-ln -s $PWD/runtime ~/.config/helix/runtime
+ln -Ts $PWD/runtime ~/.config/helix/runtime
 ```
+
+If the above command fails to create a symbolic link because the file exists either move `~/.config/helix/runtime` to a new location or delete it, then run the symlink command above again. 
 
 #### Windows
 
