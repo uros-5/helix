@@ -44,7 +44,7 @@ pub use helix_core::register::Registers;
 use helix_core::{
     auto_pairs::AutoPairs,
     syntax::{self, AutoPairConfig, SoftWrap},
-    Change,
+    Change, LineEnding, NATIVE_LINE_ENDING,
 };
 use helix_core::{Position, Selection};
 use helix_dap as dap;
@@ -273,7 +273,7 @@ pub struct Config {
     pub search: SearchConfig,
     pub lsp: LspConfig,
     pub terminal: Option<TerminalConfig>,
-    /// Column numbers at which to draw the rulers. Default to `[]`, meaning no rulers.
+    /// Column numbers at which to draw the rulers. Defaults to `[]`, meaning no rulers.
     pub rulers: Vec<u16>,
     #[serde(default)]
     pub whitespace: WhitespaceConfig,
@@ -286,6 +286,8 @@ pub struct Config {
     pub soft_wrap: SoftWrap,
     /// Workspace specific lsp ceiling dirs
     pub workspace_lsp_roots: Vec<PathBuf>,
+    /// Which line ending to choose for new documents. Defaults to `native`. i.e. `crlf` on Windows, otherwise `lf`.
+    pub default_line_ending: LineEndingConfig,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,6 +729,51 @@ impl Default for IndentGuidesConfig {
     }
 }
 
+/// Line ending configuration.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineEndingConfig {
+    /// The platform's native line ending.
+    ///
+    /// `crlf` on Windows, otherwise `lf`.
+    Native,
+    /// Line feed.
+    LF,
+    /// Carriage return followed by line feed.
+    Crlf,
+    /// Form feed.
+    #[cfg(feature = "unicode-lines")]
+    FF,
+    /// Carriage return.
+    #[cfg(feature = "unicode-lines")]
+    CR,
+    /// Next line.
+    #[cfg(feature = "unicode-lines")]
+    Nel,
+}
+
+impl Default for LineEndingConfig {
+    fn default() -> Self {
+        LineEndingConfig::Native
+    }
+}
+
+impl From<LineEndingConfig> for LineEnding {
+    fn from(line_ending: LineEndingConfig) -> Self {
+        match line_ending {
+            LineEndingConfig::Native => NATIVE_LINE_ENDING,
+            LineEndingConfig::LF => LineEnding::LF,
+            LineEndingConfig::Crlf => LineEnding::Crlf,
+            #[cfg(feature = "unicode-lines")]
+            LineEndingConfig::FF => LineEnding::FF,
+            #[cfg(feature = "unicode-lines")]
+            LineEndingConfig::CR => LineEnding::CR,
+            #[cfg(feature = "unicode-lines")]
+            LineEndingConfig::Nel => LineEnding::Nel,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -771,6 +818,7 @@ impl Default for Config {
             text_width: 80,
             completion_replace: false,
             workspace_lsp_roots: Vec::new(),
+            default_line_ending: LineEndingConfig::default(),
         }
     }
 }
@@ -1338,11 +1386,22 @@ impl Editor {
     }
 
     pub fn new_file_from_stdin(&mut self, action: Action) -> Result<DocumentId, Error> {
-        let (rope, encoding, has_bom) = crate::document::from_reader(&mut stdin(), None)?;
-        Ok(self.new_file_from_document(
-            action,
-            Document::from(rope, Some((encoding, has_bom)), self.config.clone()),
-        ))
+        let (stdin, encoding, has_bom) = crate::document::read_to_string(&mut stdin(), None)?;
+        let doc = Document::from(
+            helix_core::Rope::default(),
+            Some((encoding, has_bom)),
+            self.config.clone(),
+        );
+        let doc_id = self.new_file_from_document(action, doc);
+        let doc = doc_mut!(self, &doc_id);
+        let view = view_mut!(self);
+        doc.ensure_view_init(view.id);
+        let transaction =
+            helix_core::Transaction::insert(doc.text(), doc.selection(view.id), stdin.into())
+                .with_selection(Selection::point(0));
+        doc.apply(&transaction, view.id);
+        doc.append_changes_to_history(view);
+        Ok(doc_id)
     }
 
     // ??? possible use for integration tests
