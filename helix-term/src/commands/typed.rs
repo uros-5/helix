@@ -5,6 +5,7 @@ use crate::job::Job;
 
 use super::*;
 
+use helix_core::fuzzy::fuzzy_match;
 use helix_core::{encoding, shellwords::Shellwords};
 use helix_view::document::DEFAULT_LANGUAGE_NAME;
 use helix_view::editor::{Action, CloseError, ConfigEvent};
@@ -1265,12 +1266,10 @@ fn reload(
     }
 
     let scrolloff = cx.editor.config().scrolloff;
-    let redraw_handle = cx.editor.redraw_handle.clone();
     let (view, doc) = current!(cx.editor);
-    doc.reload(view, &cx.editor.diff_providers, redraw_handle)
-        .map(|_| {
-            view.ensure_cursor_in_view(doc, scrolloff);
-        })?;
+    doc.reload(view, &cx.editor.diff_providers).map(|_| {
+        view.ensure_cursor_in_view(doc, scrolloff);
+    })?;
     if let Some(path) = doc.path() {
         cx.editor
             .language_servers
@@ -1316,8 +1315,7 @@ fn reload_all(
         // Ensure that the view is synced with the document's history.
         view.sync_changes(doc);
 
-        let redraw_handle = cx.editor.redraw_handle.clone();
-        doc.reload(view, &cx.editor.diff_providers, redraw_handle)?;
+        doc.reload(view, &cx.editor.diff_providers)?;
         if let Some(path) = doc.path() {
             cx.editor
                 .language_servers
@@ -1538,10 +1536,8 @@ fn vsplit(
         return Ok(());
     }
 
-    let id = view!(cx.editor).doc;
-
     if args.is_empty() {
-        cx.editor.switch(id, Action::VerticalSplit);
+        split(cx.editor, Action::VerticalSplit);
     } else {
         for arg in args {
             cx.editor
@@ -1561,10 +1557,8 @@ fn hsplit(
         return Ok(());
     }
 
-    let id = view!(cx.editor).doc;
-
     if args.is_empty() {
-        cx.editor.switch(id, Action::HorizontalSplit);
+        split(cx.editor, Action::HorizontalSplit);
     } else {
         for arg in args {
             cx.editor
@@ -2297,6 +2291,29 @@ fn clear_register(
     Ok(())
 }
 
+fn redraw(
+    cx: &mut compositor::Context,
+    _args: &[Cow<str>],
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let callback = Box::pin(async move {
+        let call: job::Callback =
+            job::Callback::EditorCompositor(Box::new(|_editor, compositor| {
+                compositor.need_full_redraw();
+            }));
+
+        Ok(call)
+    });
+
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
 pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "quit",
@@ -2883,6 +2900,13 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: clear_register,
         signature: CommandSignature::none(),
     },
+    TypableCommand {
+        name: "redraw",
+        aliases: &[],
+        doc: "Clear and re-render the whole UI",
+        fun: redraw,
+        signature: CommandSignature::none(),
+    },
 ];
 
 pub static TYPABLE_COMMAND_MAP: Lazy<HashMap<&'static str, &'static TypableCommand>> =
@@ -2902,28 +2926,18 @@ pub(super) fn command_mode(cx: &mut Context) {
         ":".into(),
         Some(':'),
         |editor: &Editor, input: &str| {
-            static FUZZY_MATCHER: Lazy<fuzzy_matcher::skim::SkimMatcherV2> =
-                Lazy::new(fuzzy_matcher::skim::SkimMatcherV2::default);
-
             let shellwords = Shellwords::from(input);
             let words = shellwords.words();
 
             if words.is_empty() || (words.len() == 1 && !shellwords.ends_with_whitespace()) {
-                // If the command has not been finished yet, complete commands.
-                let mut matches: Vec<_> = typed::TYPABLE_COMMAND_LIST
-                    .iter()
-                    .filter_map(|command| {
-                        FUZZY_MATCHER
-                            .fuzzy_match(command.name, input)
-                            .map(|score| (command.name, score))
-                    })
-                    .collect();
-
-                matches.sort_unstable_by_key(|(_file, score)| std::cmp::Reverse(*score));
-                matches
-                    .into_iter()
-                    .map(|(name, _)| (0.., name.into()))
-                    .collect()
+                fuzzy_match(
+                    input,
+                    TYPABLE_COMMAND_LIST.iter().map(|command| command.name),
+                    false,
+                )
+                .into_iter()
+                .map(|(name, _)| (0.., name.into()))
+                .collect()
             } else {
                 // Otherwise, use the command's completer and the last shellword
                 // as completion input.
