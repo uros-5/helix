@@ -1318,7 +1318,7 @@ fn extend_next_long_word_end(cx: &mut Context) {
     extend_word_impl(cx, movement::move_next_long_word_end)
 }
 
-/// Separate branch to find_char designed only for <ret> char.
+/// Separate branch to find_char designed only for `<ret>` char.
 //
 // This is necessary because the one document can have different line endings inside. And we
 // cannot predict what character to find when <ret> is pressed. On the current line it can be `lf`
@@ -4391,10 +4391,9 @@ fn join_selections_impl(cx: &mut Context, select_space: bool) {
     use movement::skip_while;
     let (view, doc) = current!(cx.editor);
     let text = doc.text();
-    let slice = doc.text().slice(..);
+    let slice = text.slice(..);
 
     let mut changes = Vec::new();
-    let fragment = Tendril::from(" ");
 
     for selection in doc.selection(view.id) {
         let (start, mut end) = selection.line_range(slice);
@@ -4410,9 +4409,13 @@ fn join_selections_impl(cx: &mut Context, select_space: bool) {
             let mut end = text.line_to_char(line + 1);
             end = skip_while(slice, end, |ch| matches!(ch, ' ' | '\t')).unwrap_or(end);
 
-            // need to skip from start, not end
-            let change = (start, end, Some(fragment.clone()));
-            changes.push(change);
+            let separator = if end == line_end_char_index(&slice, line + 1) {
+                // the joining line contains only space-characters => don't include a whitespace when joining
+                None
+            } else {
+                Some(Tendril::from(" "))
+            };
+            changes.push((start, end, separator));
         }
     }
 
@@ -4423,9 +4426,6 @@ fn join_selections_impl(cx: &mut Context, select_space: bool) {
 
     changes.sort_unstable_by_key(|(from, _to, _text)| *from);
     changes.dedup();
-
-    // TODO: joining multiple empty lines should be replaced by a single space.
-    // need to merge change ranges that touch
 
     // select inserted spaces
     let transaction = if select_space {
@@ -4438,9 +4438,9 @@ fn join_selections_impl(cx: &mut Context, select_space: bool) {
             })
             .collect();
         let selection = Selection::new(ranges, 0);
-        Transaction::change(doc.text(), changes.into_iter()).with_selection(selection)
+        Transaction::change(text, changes.into_iter()).with_selection(selection)
     } else {
-        Transaction::change(doc.text(), changes.into_iter())
+        Transaction::change(text, changes.into_iter())
     };
 
     doc.apply(&transaction, view.id);
@@ -5606,12 +5606,18 @@ fn shell(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
         };
 
         // These `usize`s cannot underflow because selection ranges cannot overlap.
-        // Once the MSRV is 1.66.0 (mixed_integer_ops is stabilized), we can use checked
-        // arithmetic to assert this.
-        let anchor = (to as isize + offset - deleted_len as isize) as usize;
+        let anchor = to
+            .checked_add_signed(offset)
+            .expect("Selection ranges cannot overlap")
+            .checked_sub(deleted_len)
+            .expect("Selection ranges cannot overlap");
         let new_range = Range::new(anchor, anchor + output_len).with_direction(range.direction());
         ranges.push(new_range);
-        offset = offset + output_len as isize - deleted_len as isize;
+        offset = offset
+            .checked_add_unsigned(output_len)
+            .expect("Selection ranges cannot overlap")
+            .checked_sub_unsigned(deleted_len)
+            .expect("Selection ranges cannot overlap");
 
         changes.push((from, to, Some(output)));
     }
