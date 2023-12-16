@@ -1026,7 +1026,9 @@ fn goto_impl(
             jump_to_location(editor, location, offset_encoding, Action::Replace);
         }
         [] => {
-            editor.set_error("No definition found.");
+            if editor.language_servers.ls_len() < 2 {
+                editor.set_error("No definition found.");
+            }
         }
         _locations => {
             let picker = Picker::new(locations, cwdir, move |cx, location, action| {
@@ -1083,11 +1085,34 @@ pub fn goto_declaration(cx: &mut Context) {
 }
 
 pub fn goto_definition(cx: &mut Context) {
-    goto_single_impl(
-        cx,
-        LanguageServerFeature::GotoDefinition,
-        |ls, pos, doc_id| ls.goto_definition(doc_id, pos, None),
-    );
+    let (view, doc) = current!(cx.editor);
+    let mut futures = vec![];
+    let requests = doc.language_servers_with_feature(LanguageServerFeature::GotoDefinition);
+    for language_server in requests {
+        let offset_encoding = language_server.offset_encoding();
+        let pos = doc.position(view.id, offset_encoding);
+        let future = language_server.goto_definition(doc.identifier(), pos, None);
+        futures.push((future.unwrap(), offset_encoding));
+    }
+    if futures.is_empty() {
+        cx.editor.set_error("No language server supports hover");
+        return;
+    }
+    for future in futures.into_iter() {
+        cx.callback(
+            future.0,
+            move |editor, compositor, response: Option<lsp::GotoDefinitionResponse>| {
+                let items = to_locations(response);
+                goto_impl(editor, compositor, items, future.1);
+            },
+        )
+    }
+
+    // goto_single_impl(
+    //     cx,
+    //     LanguageServerFeature::GotoDefinition,
+    //     |ls, pos, doc_id| ls.goto_definition(doc_id, pos, None),
+    // );
 }
 
 pub fn goto_type_definition(cx: &mut Context) {

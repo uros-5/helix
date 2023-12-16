@@ -1055,7 +1055,7 @@ language-servers = [ "vuels" ]
 
 [[grammar]]
 name = "vue"
-source = { git = "https://github.com/ikatyang/tree-sitter-vue", rev = "91fe2754796cd8fba5f229505a23fa08f3546c06" }
+source = { git = "https://github.com/xiaoxin-sky/tree-sitter-vue3/", rev = "b7d0fa5464ebf936619cb65e6a1557b49af945f9" }
 
 [[language]]
 name = "yaml"
