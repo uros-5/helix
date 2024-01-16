@@ -1,6 +1,8 @@
 # Language support configuration.
 # See the languages documentation: https://docs.helix-editor.com/master/languages.html
 
+use-grammars = { except = [ "hare", "wren", "gemini" ] }
+
 [language-server]
 
 als = { command = "als" }
@@ -191,6 +193,7 @@ auto-format = true
 comment-token = "//"
 language-servers = [ "rust-analyzer" ]
 indent = { tab-width = 4, unit = "    " }
+persistent-diagnostic-sources = ["rustc", "clippy"]
 
 [language.auto-pairs]
 '(' = ')'
@@ -347,7 +350,8 @@ file-types = [
   ".vuerc",
   "composer.lock",
   ".watchmanconfig",
-  "avsc"
+  "avsc",
+  ".prettierrc"
 ]
 language-servers = [ "vscode-json-language-server" ]
 auto-format = true
@@ -1280,7 +1284,7 @@ injection-regex = "comment"
 
 [[grammar]]
 name = "comment"
-source = { git = "https://github.com/stsewd/tree-sitter-comment", rev = "a37ca370310ac6f89b6e0ebf2b86b2219780494e" }
+source = { git = "https://github.com/stsewd/tree-sitter-comment", rev = "aefcc2813392eb6ffe509aa0fc8b4e9b57413ee1" }
 
 [[language]]
 name = "wgsl"
@@ -1911,6 +1915,12 @@ file-types = ["ss", "scm"]
 shebangs = ["scheme", "guile", "chicken"]
 comment-token = ";"
 indent = { tab-width = 2, unit = "  " }
+
+[language.auto-pairs]
+'(' = ')'
+'{' = '}'
+'[' = ']'
+'"' = '"'
 
 [[grammar]]
 name = "scheme"
@@ -2878,7 +2888,7 @@ source = { git = "https://github.com/varpeti/tree-sitter-jinja2", rev = "a533cd3
 
 [[grammar]]
 name = "wren"
-source = { git = "https://git.sr.ht/~jummit/tree-sitter-wren", rev = "793d58266924e6efcc40e411663393e9d72bec87"}
+source = { git = "https://git.sr.ht/~jummit/tree-sitter-wren", rev = "6748694be32f11e7ec6b5faeb1b48ca6156d4e06" }
 
 [[language]]
 name = "wren"
@@ -3005,3 +3015,15 @@ file-types = ["janet"]
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
 grammar = "clojure"
+
+[[language]]
+name = "hocon"
+scope = "source.conf"
+file-types = ["conf"]
+comment-token = "#"
+auto-format = true
+indent = { tab-width = 2, unit = "  " }
+
+[[grammar]]
+name = "hocon"
+source = { git = "https://github.com/antosha417/tree-sitter-hocon", rev = "c390f10519ae69fdb03b3e5764f5592fb6924bcc" }
