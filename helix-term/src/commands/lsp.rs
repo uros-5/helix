@@ -23,6 +23,7 @@ use helix_core::{
 use helix_view::{
     document::{DocumentInlayHints, DocumentInlayHintsId, Mode},
     editor::Action,
+    graphics::Margin,
     theme::Style,
     Document, View,
 };
@@ -744,7 +745,16 @@ pub fn code_action(cx: &mut Context) {
             });
             picker.move_down(); // pre-select the first item
 
-            let popup = Popup::new("code-action", picker).with_scrollbar(false);
+            let margin = if editor.menu_border() {
+                Margin::vertical(1)
+            } else {
+                Margin::none()
+            };
+
+            let popup = Popup::new("code-action", picker)
+                .with_scrollbar(false)
+                .margin(margin);
+
             compositor.replace_or_push("code-action", popup);
         };
 
@@ -886,7 +896,6 @@ pub fn apply_workspace_edit(
             }
         };
 
-        let current_view_id = view!(editor).id;
         let doc_id = match editor.open(&path, Action::Load) {
             Ok(doc_id) => doc_id,
             Err(err) => {
@@ -897,7 +906,7 @@ pub fn apply_workspace_edit(
             }
         };
 
-        let doc = doc_mut!(editor, &doc_id);
+        let doc = doc!(editor, &doc_id);
         if let Some(version) = version {
             if version != doc.version() {
                 let err = format!("outdated workspace edit for {path:?}");
@@ -908,18 +917,8 @@ pub fn apply_workspace_edit(
         }
 
         // Need to determine a view for apply/append_changes_to_history
-        let selections = doc.selections();
-        let view_id = if selections.contains_key(&current_view_id) {
-            // use current if possible
-            current_view_id
-        } else {
-            // Hack: we take the first available view_id
-            selections
-                .keys()
-                .next()
-                .copied()
-                .expect("No view_id available")
-        };
+        let view_id = editor.get_synced_view_id(doc_id);
+        let doc = doc_mut!(editor, &doc_id);
 
         let transaction = helix_lsp::util::generate_transaction_from_edits(
             doc.text(),
@@ -1421,6 +1420,16 @@ pub fn rename_symbol(cx: &mut Context) {
     }
 
     let (view, doc) = current_ref!(cx.editor);
+
+    if doc
+        .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
+        .next()
+        .is_none()
+    {
+        cx.editor
+            .set_error("No configured language server supports symbol renaming");
+        return;
+    }
 
     let language_server_with_prepare_rename_support = doc
         .language_servers_with_feature(LanguageServerFeature::RenameSymbol)
