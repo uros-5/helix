@@ -795,7 +795,7 @@ fn goto_buffer(editor: &mut Editor, direction: Direction) {
             let iter = editor.documents.keys();
             let mut iter = iter.rev().skip_while(|id| *id != &current);
             iter.next(); // skip current item
-            iter.next().or_else(|| editor.documents.keys().rev().next())
+            iter.next().or_else(|| editor.documents.keys().next_back())
         }
     }
     .unwrap();
@@ -1227,7 +1227,7 @@ fn open_url(cx: &mut Context, url: Url, action: Action) {
         .unwrap_or_default();
 
     if url.scheme() != "file" {
-        return open_external_url(cx, url);
+        return cx.jobs.callback(crate::open_external_url_callback(url));
     }
 
     let content_type = std::fs::File::open(url.path()).and_then(|file| {
@@ -1240,7 +1240,9 @@ fn open_url(cx: &mut Context, url: Url, action: Action) {
     // we attempt to open binary files - files that can't be open in helix - using external
     // program as well, e.g. pdf files or images
     match content_type {
-        Ok(content_inspector::ContentType::BINARY) => open_external_url(cx, url),
+        Ok(content_inspector::ContentType::BINARY) => {
+            cx.jobs.callback(crate::open_external_url_callback(url))
+        }
         Ok(_) | Err(_) => {
             let path = &rel_path.join(url.path());
             if path.is_dir() {
@@ -1251,23 +1253,6 @@ fn open_url(cx: &mut Context, url: Url, action: Action) {
             }
         }
     }
-}
-
-/// Opens URL in external program.
-fn open_external_url(cx: &mut Context, url: Url) {
-    let commands = open::commands(url.as_str());
-    cx.jobs.callback(async {
-        for cmd in commands {
-            let mut command = tokio::process::Command::new(cmd.get_program());
-            command.args(cmd.get_args());
-            if command.output().await.is_ok() {
-                return Ok(job::Callback::Editor(Box::new(|_| {})));
-            }
-        }
-        Ok(job::Callback::Editor(Box::new(move |editor| {
-            editor.set_error("Opening URL in external program failed")
-        })))
-    });
 }
 
 fn extend_word_impl<F>(cx: &mut Context, extend_fn: F)
@@ -2184,7 +2169,7 @@ fn global_search(cx: &mut Context) {
         type Data = Option<PathBuf>;
 
         fn format(&self, current_path: &Self::Data) -> Row {
-            let relative_path = helix_core::path::get_relative_path(&self.path)
+            let relative_path = helix_stdx::path::get_relative_path(&self.path)
                 .to_string_lossy()
                 .into_owned();
             if current_path
@@ -2233,7 +2218,7 @@ fn global_search(cx: &mut Context) {
                 .case_smart(smart_case)
                 .build(regex.as_str())
             {
-                let search_root = helix_loader::current_working_dir();
+                let search_root = helix_stdx::env::current_working_dir();
                 if !search_root.exists() {
                     cx.editor
                         .set_error("Current working directory does not exist");
@@ -2746,7 +2731,7 @@ fn file_picker_in_current_buffer_directory(cx: &mut Context) {
 }
 
 fn file_picker_in_current_directory(cx: &mut Context) {
-    let cwd = helix_loader::current_working_dir();
+    let cwd = helix_stdx::env::current_working_dir();
     if !cwd.exists() {
         cx.editor
             .set_error("Current working directory does not exist");
@@ -2774,7 +2759,7 @@ fn buffer_picker(cx: &mut Context) {
             let path = self
                 .path
                 .as_deref()
-                .map(helix_core::path::get_relative_path);
+                .map(helix_stdx::path::get_relative_path);
             let path = match path.as_deref().and_then(Path::to_str) {
                 Some(path) => path,
                 None => SCRATCH_BUFFER_NAME,
@@ -2804,7 +2789,7 @@ fn buffer_picker(cx: &mut Context) {
         .editor
         .documents
         .values()
-        .map(|doc| new_meta(doc))
+        .map(new_meta)
         .collect::<Vec<BufferMeta>>();
 
     // mru
@@ -2841,7 +2826,7 @@ fn jumplist_picker(cx: &mut Context) {
             let path = self
                 .path
                 .as_deref()
-                .map(helix_core::path::get_relative_path);
+                .map(helix_stdx::path::get_relative_path);
             let path = match path.as_deref().and_then(Path::to_str) {
                 Some(path) => path,
                 None => SCRATCH_BUFFER_NAME,

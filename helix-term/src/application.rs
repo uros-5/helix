@@ -1,10 +1,12 @@
 use arc_swap::{access::Map, ArcSwap};
 use futures_util::Stream;
-use helix_core::{path::get_relative_path, pos_at_coords, syntax, Selection};
+use helix_core::{pos_at_coords, syntax, Selection};
 use helix_lsp::{
     lsp::{self, notification::Notification},
+    util::lsp_range_to_range,
     LspProgressMap,
 };
+use helix_stdx::path::get_relative_path;
 use helix_view::{
     align_view,
     document::DocumentSavedEventResult,
@@ -27,7 +29,7 @@ use crate::{
     ui::{self, overlay::overlaid},
 };
 
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 #[cfg(not(feature = "integration"))]
 use std::io::stdout;
 use std::{collections::btree_map::Entry, io::stdin, path::Path, sync::Arc};
@@ -683,9 +685,13 @@ impl Application {
             Call::Notification(helix_lsp::jsonrpc::Notification { method, params, .. }) => {
                 let notification = match Notification::parse(&method, params) {
                     Ok(notification) => notification,
+                    Err(helix_lsp::Error::Unhandled) => {
+                        info!("Ignoring Unhandled notification from Language Server");
+                        return;
+                    }
                     Err(err) => {
-                        log::error!(
-                            "received malformed notification from Language Server: {}",
+                        error!(
+                            "Ignoring unknown notification from Language Server: {}",
                             err
                         );
                         return;
@@ -1096,12 +1102,81 @@ impl Application {
                         }
                         Ok(serde_json::Value::Null)
                     }
+                    Ok(MethodCall::ShowDocument(params)) => {
+                        let language_server = language_server!();
+                        let offset_encoding = language_server.offset_encoding();
+
+                        let result = self.handle_show_document(params, offset_encoding);
+                        Ok(json!(result))
+                    }
                 };
 
                 tokio::spawn(language_server!().reply(id, reply));
             }
             Call::Invalid { id } => log::error!("LSP invalid method call id={:?}", id),
         }
+    }
+
+    fn handle_show_document(
+        &mut self,
+        params: lsp::ShowDocumentParams,
+        offset_encoding: helix_lsp::OffsetEncoding,
+    ) -> lsp::ShowDocumentResult {
+        if let lsp::ShowDocumentParams {
+            external: Some(true),
+            uri,
+            ..
+        } = params
+        {
+            self.jobs.callback(crate::open_external_url_callback(uri));
+            return lsp::ShowDocumentResult { success: true };
+        };
+
+        let lsp::ShowDocumentParams {
+            uri,
+            selection,
+            take_focus,
+            ..
+        } = params;
+
+        let path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(err) => {
+                log::error!("unsupported file URI: {}: {:?}", uri, err);
+                return lsp::ShowDocumentResult { success: false };
+            }
+        };
+
+        let action = match take_focus {
+            Some(true) => helix_view::editor::Action::Replace,
+            _ => helix_view::editor::Action::VerticalSplit,
+        };
+
+        let doc_id = match self.editor.open(&path, action) {
+            Ok(id) => id,
+            Err(err) => {
+                log::error!("failed to open path: {:?}: {:?}", uri, err);
+                return lsp::ShowDocumentResult { success: false };
+            }
+        };
+
+        let doc = doc_mut!(self.editor, &doc_id);
+        if let Some(range) = selection {
+            // TODO: convert inside server
+            if let Some(new_range) = lsp_range_to_range(doc.text(), range, offset_encoding) {
+                let view = view_mut!(self.editor);
+
+                // we flip the range so that the cursor sits on the start of the symbol
+                // (for example start of the function).
+                doc.set_selection(view.id, Selection::single(new_range.head, new_range.anchor));
+                if action.align_view(view, doc.id()) {
+                    align_view(doc, view, Align::Center);
+                }
+            } else {
+                log::warn!("lsp position out of bounds - {:?}", range);
+            };
+        };
+        lsp::ShowDocumentResult { success: true }
     }
 
     async fn claim_term(&mut self) -> std::io::Result<()> {
