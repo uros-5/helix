@@ -36,6 +36,7 @@ use helix_core::{
 };
 
 use crate::editor::Config;
+use crate::events::{DocumentDidChange, SelectionDidChange};
 use crate::{DocumentId, Editor, Theme, View, ViewId};
 
 /// 8kB of buffer space for encoding and decoding `Rope`s.
@@ -114,19 +115,6 @@ pub struct SavePoint {
     /// The view this savepoint is associated with
     pub view: ViewId,
     revert: Mutex<Transaction>,
-    pub text: Rope,
-}
-
-impl SavePoint {
-    pub fn cursor(&self) -> usize {
-        // we always create transactions with selections
-        self.revert
-            .lock()
-            .selection()
-            .unwrap()
-            .primary()
-            .cursor(self.text.slice(..))
-    }
 }
 
 pub struct Document {
@@ -738,7 +726,12 @@ impl Document {
         if let Some((fmt_cmd, fmt_args)) = self
             .language_config()
             .and_then(|c| c.formatter.as_ref())
-            .and_then(|formatter| Some((which::which(&formatter.command).ok()?, &formatter.args)))
+            .and_then(|formatter| {
+                Some((
+                    helix_stdx::env::which(&formatter.command).ok()?,
+                    &formatter.args,
+                ))
+            })
         {
             use std::process::Stdio;
             let text = self.text().clone();
@@ -855,7 +848,7 @@ impl Document {
         let text = self.text().clone();
 
         let path = match path {
-            Some(path) => helix_core::path::get_canonicalized_path(&path),
+            Some(path) => helix_stdx::path::canonicalize(path),
             None => {
                 if self.path.is_none() {
                     bail!("Can't save with no path set!");
@@ -1049,7 +1042,7 @@ impl Document {
     }
 
     pub fn set_path(&mut self, path: Option<&Path>) {
-        let path = path.map(helix_core::path::get_canonicalized_path);
+        let path = path.map(helix_stdx::path::canonicalize);
 
         // if parent doesn't exist we still want to open the document
         // and error out when document is saved
@@ -1096,6 +1089,10 @@ impl Document {
         // TODO: use a transaction?
         self.selections
             .insert(view_id, selection.ensure_invariants(self.text().slice(..)));
+        helix_event::dispatch(SelectionDidChange {
+            doc: self,
+            view: view_id,
+        })
     }
 
     /// Find the origin selection of the text in a document, i.e. where
@@ -1149,6 +1146,14 @@ impl Document {
         let success = transaction.changes().apply(&mut self.text);
 
         if success {
+            if emit_lsp_notification {
+                helix_event::dispatch(DocumentDidChange {
+                    doc: self,
+                    view: view_id,
+                    old_text: &old_doc,
+                });
+            }
+
             for selection in self.selections.values_mut() {
                 *selection = selection
                     .clone()
@@ -1164,6 +1169,10 @@ impl Document {
                     view_id,
                     selection.clone().ensure_invariants(self.text.slice(..)),
                 );
+                helix_event::dispatch(SelectionDidChange {
+                    doc: self,
+                    view: view_id,
+                });
             }
 
             self.modified_since_accessed = true;
@@ -1276,6 +1285,7 @@ impl Document {
             }
 
             if emit_lsp_notification {
+                // TODO: move to hook
                 // emit lsp notification
                 for language_server in self.language_servers() {
                     let notify = language_server.text_document_did_change(
@@ -1386,7 +1396,6 @@ impl Document {
         let savepoint = Arc::new(SavePoint {
             view: view.id,
             revert: Mutex::new(revert),
-            text: self.text.clone(),
         });
         self.savepoints.push(Arc::downgrade(&savepoint));
         savepoint
@@ -1672,7 +1681,7 @@ impl Document {
     pub fn relative_path(&self) -> Option<PathBuf> {
         self.path
             .as_deref()
-            .map(helix_core::path::get_relative_path)
+            .map(helix_stdx::path::get_relative_path)
     }
 
     pub fn display_name(&self) -> Cow<'static, str> {
