@@ -1832,7 +1832,7 @@ language-servers = [ "nu-lsp" ]
 
 [[grammar]]
 name = "nu"
-source = { git = "https://github.com/nushell/tree-sitter-nu", rev = "98c11c491e3405c75affa1cf004097692da3dda2" }
+source = { git = "https://github.com/nushell/tree-sitter-nu", rev = "358c4f509eb97f0148bbd25ad36acc729819b9c1" }
 
 [[language]]
 name = "vala"
@@ -2139,7 +2139,7 @@ language-servers = [ "slint-lsp" ]
 
 [[grammar]]
 name = "slint"
-source = { git = "https://github.com/jrmoulton/tree-sitter-slint", rev = "00c8a2d3645766f68c0d0460086c0a994e5b0d85" }
+source = { git = "https://github.com/slint-ui/tree-sitter-slint", rev = "15618215b79b9db08f824a5c97a12d073dcc1c00" }
 
 [[language]]
 name = "task"
@@ -2940,7 +2940,7 @@ indent = { tab-width = 4, unit = "    " }
 
 [[grammar]]
 name = "unison"
-source = { git = "https://github.com/kylegoetz/tree-sitter-unison", rev = "aaec316774c8b50d367ec7cf26523aac5ef0cfc5" }
+source = { git = "https://github.com/kylegoetz/tree-sitter-unison", rev = "1f505e2447fa876a87aee47ff3d70b9e141c744f" }
 
 [[language]]
 name = "todotxt"
@@ -3042,3 +3042,33 @@ indent = { tab-width = 2, unit = "  " }
 [[grammar]]
 name = "hocon"
 source = { git = "https://github.com/antosha417/tree-sitter-hocon", rev = "c390f10519ae69fdb03b3e5764f5592fb6924bcc" }
+
+[[language]]
+name = "tact"
+scope = "source.tact"
+injection-regex = "tact"
+file-types = ["tact"]
+comment-token = "//"
+indent = { tab-width = 4, unit = "    " }
+
+[language.auto-pairs]
+'"' = '"'
+'{' = '}'
+'(' = ')'
+'<' = '>'
+
+[[grammar]]
+name = "tact"
+source = { git = "https://github.com/tact-lang/tree-sitter-tact", rev = "ec57ab29c86d632639726631fb2bb178d23e1c91" }
+
+[[language]]
+name = "pkl"
+scope = "source.pkl"
+injection-regex = "pkl"
+file-types = ["pkl", "pcf"]
+comment-token = "//"
+indent = { tab-width = 2, unit = "  " }
+
+[[grammar]]
+name = "pkl"
+source = { git = "https://github.com/apple/tree-sitter-pkl", rev = "c03f04a313b712f8ab00a2d862c10b37318699ae" }
