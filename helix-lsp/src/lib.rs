@@ -796,6 +796,11 @@ impl Registry {
     pub fn iter_clients(&self) -> impl Iterator<Item = &Arc<Client>> {
         self.inner.values().flatten()
     }
+
+    pub fn ls_len(&self) -> usize {
+        self.inner.len()
+    }
+        
 }
 
 #[derive(Debug)]

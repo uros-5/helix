@@ -826,7 +826,11 @@ fn goto_impl(
         [location] => {
             jump_to_location(editor, location, offset_encoding, Action::Replace);
         }
-        [] => unreachable!("`locations` should be non-empty for `goto_impl`"),
+        [] => {
+            if editor.language_servers.ls_len() < 2 {
+                editor.set_error("No language server supports this feature.");
+            } 
+        },
         _locations => {
             let picker = Picker::new(locations, cwdir, move |cx, location, action| {
                 jump_to_location(cx.editor, location, offset_encoding, action)
@@ -886,13 +890,29 @@ pub fn goto_declaration(cx: &mut Context) {
 }
 
 pub fn goto_definition(cx: &mut Context) {
-    goto_single_impl(
-        cx,
-        LanguageServerFeature::GotoDefinition,
-        |ls, pos, doc_id| ls.goto_definition(doc_id, pos, None),
-    );
+    let (view, doc) = current!(cx.editor);
+    let mut futures = vec![];
+    let requests = doc.language_servers_with_feature(LanguageServerFeature::GotoDefinition);
+    for language_server in requests {
+        let offset_encoding = language_server.offset_encoding();
+        let pos = doc.position(view.id, offset_encoding);
+        let future = language_server.goto_definition(doc.identifier(), pos, None);
+        futures.push((future.unwrap(), offset_encoding));
+    }
+    if futures.is_empty() {
+        cx.editor.set_error("No language server supports hover");
+        return;
+    }
+    for future in futures.into_iter() {
+        cx.callback(
+            future.0,
+            move |editor, compositor, response: Option<lsp::GotoDefinitionResponse>| {
+                let items = to_locations(response);
+                goto_impl(editor, compositor, items, future.1);
+            },
+        )
+    }
 }
-
 pub fn goto_type_definition(cx: &mut Context) {
     goto_single_impl(
         cx,
@@ -909,36 +929,41 @@ pub fn goto_implementation(cx: &mut Context) {
     );
 }
 
+
 pub fn goto_reference(cx: &mut Context) {
     let config = cx.editor.config();
     let (view, doc) = current!(cx.editor);
+    let mut futures = vec![];
 
     // TODO could probably support multiple language servers,
     // not sure if there's a real practical use case for this though
-    let language_server =
-        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::GotoReference);
-    let offset_encoding = language_server.offset_encoding();
-    let pos = doc.position(view.id, offset_encoding);
-    let future = language_server
-        .goto_reference(
-            doc.identifier(),
-            pos,
-            config.lsp.goto_reference_include_declaration,
-            None,
-        )
-        .unwrap();
-
-    cx.callback(
-        future,
-        move |editor, compositor, response: Option<Vec<lsp::Location>>| {
-            let items = response.unwrap_or_default();
-            if items.is_empty() {
-                editor.set_error("No references found.");
-            } else {
-                goto_impl(editor, compositor, items, offset_encoding);
-            }
-        },
-    );
+    let requests = doc.language_servers_with_feature(LanguageServerFeature::GotoReference);
+    for language_server in requests {
+        let offset_encoding = language_server.offset_encoding();
+        let pos = doc.position(view.id, offset_encoding);
+        let future = language_server
+            .goto_reference(
+                doc.identifier(),
+                pos,
+                config.lsp.goto_reference_include_declaration,
+                None,
+            )
+            .unwrap();
+        futures.push((future, offset_encoding));
+    }
+    if futures.is_empty() {
+        cx.editor.set_error("No language server supports hover");
+        return;
+    }
+    for future in futures.into_iter() {
+        cx.callback(
+            future.0,
+            move |editor, compositor, response: Option<Vec<lsp::Location>>| {
+                let items = response.unwrap_or_default();
+                goto_impl(editor, compositor, items, future.1);
+            },
+        );
+    }
 }
 
 pub fn signature_help(cx: &mut Context) {
