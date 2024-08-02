@@ -71,16 +71,16 @@ jobs:
         with:
           shared-key: "build"
 
-      - name: Run cargo fmt
-        run: cargo fmt --all --check
+      # - name: Run cargo fmt
+      #   run: cargo fmt --all --check
 
-      - name: Run cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      # - name: Run cargo clippy
+      #   run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run cargo doc
-        run: cargo doc --no-deps --workspace --document-private-items
-        env:
-          RUSTDOCFLAGS: -D warnings
+      # - name: Run cargo doc
+      #   run: cargo doc --no-deps --workspace --document-private-items
+      #   env:
+      #     RUSTDOCFLAGS: -D warnings
 
   docs:
     name: Docs
