@@ -865,7 +865,11 @@ fn goto_impl(
         [location] => {
             jump_to_location(editor, location, offset_encoding, Action::Replace);
         }
-        [] => unreachable!("`locations` should be non-empty for `goto_impl`"),
+        [] => {
+            if editor.language_servers.ls_len() < 2 {
+                editor.set_error("No definition found.");
+            }
+        }
         _locations => {
             let columns = [ui::PickerColumn::new(
                 "location",
@@ -997,34 +1001,38 @@ pub fn goto_reference(cx: &mut Context) {
     // TODO could probably support multiple language servers,
     // not sure if there's a real practical use case for this though
 
-    let language_server =
-        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::GotoReference);
-    let offset_encoding = language_server.offset_encoding();
-    let pos = doc.position(view.id, offset_encoding);
-    let future = language_server
-        .goto_reference(
-            doc.identifier(),
-            pos,
-            config.lsp.goto_reference_include_declaration,
-            None,
-        )
-        .unwrap();
+    let requests = doc.language_servers_with_feature(LanguageServerFeature::GotoReference);
+    for language_server in requests {
+        let offset_encoding = language_server.offset_encoding();
+        let pos = doc.position(view.id, offset_encoding);
+        let future = language_server
+            .goto_reference(
+                doc.identifier(),
+                pos,
+                config.lsp.goto_reference_include_declaration,
+                None,
+            )
+            .unwrap();
+        futures.push((future, offset_encoding));
+    }
+    if futures.is_empty() {
+        cx.editor.set_error("No language server supports hover");
+        return;
+    }
+    for future in futures.into_iter() {
+        cx.callback(
+            future.0,
+            move |editor, compositor, response: Option<Vec<lsp::Location>>| {
+                let items: Vec<Location> = response
+                    .into_iter()
+                    .flatten()
+                    .flat_map(lsp_location_to_location)
+                    .collect();
 
-    cx.callback(
-        future,
-        move |editor, compositor, response: Option<Vec<lsp::Location>>| {
-            let items: Vec<Location> = response
-                .into_iter()
-                .flatten()
-                .flat_map(lsp_location_to_location)
-                .collect();
-            if items.is_empty() {
-                editor.set_error("No references found.");
-            } else {
-                goto_impl(editor, compositor, items, offset_encoding);
-            }
-        },
-    );
+                goto_impl(editor, compositor, items, future.1);
+            },
+        );
+    }
 }
 
 pub fn signature_help(cx: &mut Context) {
