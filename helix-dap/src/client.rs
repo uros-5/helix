@@ -2,7 +2,7 @@ use crate::{
     requests::DisconnectArguments,
     transport::{Payload, Request, Response, Transport},
     types::*,
-    Error, Result, ThreadId,
+    Error, Result,
 };
 use helix_core::syntax::DebuggerQuirks;
 
@@ -113,7 +113,7 @@ impl Client {
         id: usize,
     ) -> Result<(Self, UnboundedReceiver<Payload>)> {
         // Resolve path to the binary
-        let cmd = which::which(cmd).map_err(|err| anyhow::anyhow!(err))?;
+        let cmd = helix_stdx::env::which(cmd)?;
 
         let process = Command::new(cmd)
             .args(args)
@@ -157,8 +157,8 @@ impl Client {
         )
     }
 
-    pub fn starting_request_args(&self) -> &Option<Value> {
-        &self.starting_request_args
+    pub fn starting_request_args(&self) -> Option<&Value> {
+        self.starting_request_args.as_ref()
     }
 
     pub async fn tcp_process(

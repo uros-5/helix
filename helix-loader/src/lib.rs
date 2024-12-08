@@ -53,7 +53,7 @@ fn prioritize_runtime_dirs() -> Vec<PathBuf> {
     rt_dirs.push(conf_rt_dir);
 
     if let Ok(dir) = std::env::var("HELIX_RUNTIME") {
-        let dir = path::expand_tilde(dir);
+        let dir = path::expand_tilde(Path::new(&dir));
         rt_dirs.push(path::normalize(dir));
     }
 
@@ -126,7 +126,7 @@ pub fn config_dir() -> PathBuf {
 
 pub fn cache_dir() -> PathBuf {
     // TODO: allow env var override
-    let strategy = choose_base_strategy().expect("Unable to find the config directory!");
+    let strategy = choose_base_strategy().expect("Unable to find the cache directory!");
     let mut path = strategy.cache_dir();
     path.push("helix");
     path
@@ -225,13 +225,17 @@ pub fn merge_toml_values(left: toml::Value, right: toml::Value, merge_depth: usi
 /// Used as a ceiling dir for LSP root resolution, the filepicker and potentially as a future filewatching root
 ///
 /// This function starts searching the FS upward from the CWD
-/// and returns the first directory that contains either `.git` or `.helix`.
+/// and returns the first directory that contains either `.git`, `.svn`, `.jj` or `.helix`.
 /// If no workspace was found returns (CWD, true).
 /// Otherwise (workspace, false) is returned
 pub fn find_workspace() -> (PathBuf, bool) {
     let current_dir = current_working_dir();
     for ancestor in current_dir.ancestors() {
-        if ancestor.join(".git").exists() || ancestor.join(".helix").exists() {
+        if ancestor.join(".git").exists()
+            || ancestor.join(".svn").exists()
+            || ancestor.join(".jj").exists()
+            || ancestor.join(".helix").exists()
+        {
             return (ancestor.to_owned(), false);
         }
     }

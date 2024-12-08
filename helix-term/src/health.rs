@@ -1,10 +1,10 @@
+use crate::config::{Config, ConfigLoadError};
 use crossterm::{
     style::{Color, Print, Stylize},
     tty::IsTty,
 };
-use helix_core::config::{default_syntax_loader, user_syntax_loader};
+use helix_core::config::{default_lang_config, user_lang_config};
 use helix_loader::grammar::load_runtime_file;
-use helix_view::clipboard::get_clipboard_provider;
 use std::io::Write;
 
 #[derive(Copy, Clone)]
@@ -53,7 +53,6 @@ pub fn general() -> std::io::Result<()> {
     let lang_file = helix_loader::lang_config_file();
     let log_file = helix_loader::log_file();
     let rt_dirs = helix_loader::runtime_dirs();
-    let clipboard_provider = get_clipboard_provider();
 
     if config_file.exists() {
         writeln!(stdout, "Config file: {}", config_file.display())?;
@@ -92,7 +91,6 @@ pub fn general() -> std::io::Result<()> {
             writeln!(stdout, "{}", msg.yellow())?;
         }
     }
-    writeln!(stdout, "Clipboard provider: {}", clipboard_provider.name())?;
 
     Ok(())
 }
@@ -101,8 +99,19 @@ pub fn clipboard() -> std::io::Result<()> {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
 
-    let board = get_clipboard_provider();
-    match board.name().as_ref() {
+    let config = match Config::load_default() {
+        Ok(config) => config,
+        Err(ConfigLoadError::Error(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            Config::default()
+        }
+        Err(err) => {
+            writeln!(stdout, "{}", "Configuration file malformed".red())?;
+            writeln!(stdout, "{}", err)?;
+            return Ok(());
+        }
+    };
+
+    match config.editor.clipboard_provider.name().as_ref() {
         "none" => {
             writeln!(
                 stdout,
@@ -128,7 +137,7 @@ pub fn languages_all() -> std::io::Result<()> {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
 
-    let mut syn_loader_conf = match user_syntax_loader() {
+    let mut syn_loader_conf = match user_lang_config() {
         Ok(conf) => conf,
         Err(err) => {
             let stderr = std::io::stderr();
@@ -141,11 +150,11 @@ pub fn languages_all() -> std::io::Result<()> {
                 err
             )?;
             writeln!(stderr, "{}", "Using default language config".yellow())?;
-            default_syntax_loader()
+            default_lang_config()
         }
     };
 
-    let mut headings = vec!["Language", "LSP", "DAP", "Formatter"];
+    let mut headings = vec!["Language", "Language servers", "Debug adapter", "Formatter"];
 
     for feat in TsFeature::all() {
         headings.push(feat.short_title())
@@ -182,7 +191,7 @@ pub fn languages_all() -> std::io::Result<()> {
         .sort_unstable_by_key(|l| l.language_id.clone());
 
     let check_binary = |cmd: Option<&str>| match cmd {
-        Some(cmd) => match which::which(cmd) {
+        Some(cmd) => match helix_stdx::env::which(cmd) {
             Ok(_) => column(&format!("✓ {}", cmd), Color::Green),
             Err(_) => column(&format!("✘ {}", cmd), Color::Red),
         },
@@ -234,7 +243,7 @@ pub fn language(lang_str: String) -> std::io::Result<()> {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
 
-    let syn_loader_conf = match user_syntax_loader() {
+    let syn_loader_conf = match user_lang_config() {
         Ok(conf) => conf,
         Err(err) => {
             let stderr = std::io::stderr();
@@ -247,7 +256,7 @@ pub fn language(lang_str: String) -> std::io::Result<()> {
                 err
             )?;
             writeln!(stderr, "{}", "Using default language config".yellow())?;
-            default_syntax_loader()
+            default_lang_config()
         }
     };
 
@@ -322,7 +331,7 @@ fn probe_protocols<'a, I: Iterator<Item = &'a str> + 'a>(
     writeln!(stdout)?;
 
     for cmd in server_cmds {
-        let (path, icon) = match which::which(cmd) {
+        let (path, icon) = match helix_stdx::env::which(cmd) {
             Ok(path) => (path.display().to_string().green(), "✓".green()),
             Err(_) => (format!("'{}' not found in $PATH", cmd).red(), "✘".red()),
         };
@@ -344,7 +353,7 @@ fn probe_protocol(protocol_name: &str, server_cmd: Option<String>) -> std::io::R
     writeln!(stdout, "Configured {}: {}", protocol_name, cmd_name)?;
 
     if let Some(cmd) = server_cmd {
-        let path = match which::which(&cmd) {
+        let path = match helix_stdx::env::which(&cmd) {
             Ok(path) => path.display().to_string().green(),
             Err(_) => format!("'{}' not found in $PATH", cmd).red(),
         };

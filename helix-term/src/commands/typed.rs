@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::io::BufReader;
 use std::ops::Deref;
 
 use crate::job::Job;
@@ -7,10 +8,10 @@ use super::*;
 
 use helix_core::fuzzy::fuzzy_match;
 use helix_core::indent::MAX_INDENT;
-use helix_core::{encoding, line_ending, shellwords::Shellwords};
-use helix_lsp::{OffsetEncoding, Url};
-use helix_view::document::DEFAULT_LANGUAGE_NAME;
-use helix_view::editor::{Action, CloseError, ConfigEvent};
+use helix_core::{line_ending, shellwords::Shellwords};
+use helix_stdx::path::home_dir;
+use helix_view::document::{read_to_string, DEFAULT_LANGUAGE_NAME};
+use helix_view::editor::{CloseError, ConfigEvent};
 use serde_json::Value;
 use ui::completers::{self, Completer};
 
@@ -111,14 +112,14 @@ fn open(cx: &mut compositor::Context, args: &[Cow<str>], event: PromptEvent) -> 
     ensure!(!args.is_empty(), "wrong argument count");
     for arg in args {
         let (path, pos) = args::parse_file(arg);
-        let path = helix_stdx::path::expand_tilde(&path);
+        let path = helix_stdx::path::expand_tilde(path);
         // If the path is a directory, open a file picker on that directory and update the status
         // message
         if let Ok(true) = std::fs::canonicalize(&path).map(|p| p.is_dir()) {
             let callback = async move {
                 let call: job::Callback = job::Callback::EditorCompositor(Box::new(
                     move |editor: &mut Editor, compositor: &mut Compositor| {
-                        let picker = ui::file_picker(path, &editor.config());
+                        let picker = ui::file_picker(path.into_owned(), &editor.config());
                         compositor.push(Box::new(overlaid(picker)));
                     },
                 ));
@@ -164,9 +165,10 @@ fn buffer_close_by_ids_impl(
             cx.editor.switch(*first, Action::Replace);
         }
         bail!(
-            "{} unsaved buffer(s) remaining: {:?}",
+            "{} unsaved buffer{} remaining: {:?}",
             modified_names.len(),
-            modified_names
+            if modified_names.len() == 1 { "" } else { "s" },
+            modified_names,
         );
     }
 
@@ -310,7 +312,7 @@ fn buffer_next(
         return Ok(());
     }
 
-    goto_buffer(cx.editor, Direction::Forward);
+    goto_buffer(cx.editor, Direction::Forward, 1);
     Ok(())
 }
 
@@ -323,7 +325,7 @@ fn buffer_previous(
         return Ok(());
     }
 
-    goto_buffer(cx.editor, Direction::Backward);
+    goto_buffer(cx.editor, Direction::Backward, 1);
     Ok(())
 }
 
@@ -338,8 +340,11 @@ fn write_impl(
     let path = path.map(AsRef::as_ref);
 
     if config.insert_final_newline {
-        insert_final_newline(doc, view);
+        insert_final_newline(doc, view.id);
     }
+
+    // Save an undo checkpoint for any outstanding changes.
+    doc.append_changes_to_history(view);
 
     let fmt = if config.auto_format {
         doc.auto_format().map(|fmt| {
@@ -365,13 +370,12 @@ fn write_impl(
     Ok(())
 }
 
-fn insert_final_newline(doc: &mut Document, view: &mut View) {
+fn insert_final_newline(doc: &mut Document, view_id: ViewId) {
     let text = doc.text();
     if line_ending::get_line_ending(&text.slice(..)).is_none() {
         let eof = Selection::point(text.len_chars());
         let insert = Transaction::insert(text, &eof, doc.line_ending.as_str().into());
-        doc.apply(&insert, view.id);
-        doc.append_changes_to_history(view);
+        doc.apply(&insert, view_id);
     }
 }
 
@@ -453,13 +457,15 @@ fn format(
     }
 
     let (view, doc) = current!(cx.editor);
-    if let Some(format) = doc.format() {
-        let callback = make_format_callback(doc.id(), doc.version(), view.id, format, None);
-        cx.jobs.callback(callback);
-    }
+    let format = doc.format().context(
+        "A formatter isn't available, and no language server provides formatting capabilities",
+    )?;
+    let callback = make_format_callback(doc.id(), doc.version(), view.id, format, None);
+    cx.jobs.callback(callback);
 
     Ok(())
 }
+
 fn set_indent_style(
     cx: &mut compositor::Context,
     args: &[Cow<str>],
@@ -658,9 +664,10 @@ pub(super) fn buffers_remaining_impl(editor: &mut Editor) -> anyhow::Result<()> 
             editor.switch(*first, Action::Replace);
         }
         bail!(
-            "{} unsaved buffer(s) remaining: {:?}",
+            "{} unsaved buffer{} remaining: {:?}",
             modified_names.len(),
-            modified_names
+            if modified_names.len() == 1 { "" } else { "s" },
+            modified_names,
         );
     }
     Ok(())
@@ -701,10 +708,14 @@ pub fn write_all_impl(
 
     for (doc_id, target_view) in saves {
         let doc = doc_mut!(cx.editor, &doc_id);
+        let view = view_mut!(cx.editor, target_view);
 
         if config.insert_final_newline {
-            insert_final_newline(doc, view_mut!(cx.editor, target_view));
+            insert_final_newline(doc, target_view);
         }
+
+        // Save an undo checkpoint for any outstanding changes.
+        doc.append_changes_to_history(view);
 
         let fmt = if config.auto_format {
             doc.auto_format().map(|fmt| {
@@ -1066,7 +1077,7 @@ fn show_clipboard_provider(
     }
 
     cx.editor
-        .set_status(cx.editor.registers.clipboard_provider_name().to_string());
+        .set_status(cx.editor.registers.clipboard_provider_name());
     Ok(())
 }
 
@@ -1079,18 +1090,23 @@ fn change_current_directory(
         return Ok(());
     }
 
-    let dir = helix_stdx::path::expand_tilde(
-        args.first()
-            .context("target directory not provided")?
-            .as_ref(),
-    );
+    let dir = match args.first().map(AsRef::as_ref) {
+        Some("-") => cx
+            .editor
+            .last_cwd
+            .clone()
+            .ok_or(anyhow!("No previous working directory"))?,
+        Some(input_path) => helix_stdx::path::expand_tilde(Path::new(input_path)).to_path_buf(),
+        None => home_dir()?,
+    };
 
-    helix_stdx::env::set_current_working_dir(dir)?;
+    cx.editor.last_cwd = helix_stdx::env::set_current_working_dir(dir)?;
 
     cx.editor.set_status(format!(
         "Current working directory is now {}",
         helix_stdx::env::current_working_dir().display()
     ));
+
     Ok(())
 }
 
@@ -1319,7 +1335,11 @@ fn reload_all(
         // Ensure that the view is synced with the document's history.
         view.sync_changes(doc);
 
-        doc.reload(view, &cx.editor.diff_providers)?;
+        if let Err(error) = doc.reload(view, &cx.editor.diff_providers) {
+            cx.editor.set_error(format!("{}", error));
+            continue;
+        }
+
         if let Some(path) = doc.path() {
             cx.editor
                 .language_servers
@@ -1364,37 +1384,49 @@ fn lsp_workspace_command(
     if event != PromptEvent::Validate {
         return Ok(());
     }
+
     let doc = doc!(cx.editor);
-    let Some((language_server_id, options)) = doc
+    let ls_id_commands = doc
         .language_servers_with_feature(LanguageServerFeature::WorkspaceCommand)
-        .find_map(|ls| {
+        .flat_map(|ls| {
             ls.capabilities()
                 .execute_command_provider
-                .as_ref()
-                .map(|options| (ls.id(), options))
-        })
-    else {
-        cx.editor
-            .set_status("No active language servers for this document support workspace commands");
-        return Ok(());
-    };
+                .iter()
+                .flat_map(|options| options.commands.iter())
+                .map(|command| (ls.id(), command))
+        });
 
     if args.is_empty() {
-        let commands = options
-            .commands
-            .iter()
-            .map(|command| helix_lsp::lsp::Command {
-                title: command.clone(),
-                command: command.clone(),
-                arguments: None,
+        let commands = ls_id_commands
+            .map(|(ls_id, command)| {
+                (
+                    ls_id,
+                    helix_lsp::lsp::Command {
+                        title: command.clone(),
+                        command: command.clone(),
+                        arguments: None,
+                    },
+                )
             })
             .collect::<Vec<_>>();
         let callback = async move {
             let call: job::Callback = Callback::EditorCompositor(Box::new(
                 move |_editor: &mut Editor, compositor: &mut Compositor| {
-                    let picker = ui::Picker::new(commands, (), move |cx, command, _action| {
-                        execute_lsp_command(cx.editor, language_server_id, command.clone());
-                    });
+                    let columns = [ui::PickerColumn::new(
+                        "title",
+                        |(_ls_id, command): &(_, helix_lsp::lsp::Command), _| {
+                            command.title.as_str().into()
+                        },
+                    )];
+                    let picker = ui::Picker::new(
+                        columns,
+                        0,
+                        commands,
+                        (),
+                        move |cx, (ls_id, command), _action| {
+                            execute_lsp_command(cx.editor, *ls_id, command.clone());
+                        },
+                    );
                     compositor.push(Box::new(overlaid(picker)))
                 },
             ));
@@ -1403,21 +1435,32 @@ fn lsp_workspace_command(
         cx.jobs.callback(callback);
     } else {
         let command = args.join(" ");
-        if options.commands.iter().any(|c| c == &command) {
-            execute_lsp_command(
-                cx.editor,
-                language_server_id,
-                helix_lsp::lsp::Command {
-                    title: command.clone(),
-                    arguments: None,
-                    command,
-                },
-            );
-        } else {
-            cx.editor.set_status(format!(
-                "`{command}` is not supported for this language server"
-            ));
-            return Ok(());
+        let matches: Vec<_> = ls_id_commands
+            .filter(|(_ls_id, c)| *c == &command)
+            .collect();
+
+        match matches.as_slice() {
+            [(ls_id, _command)] => {
+                execute_lsp_command(
+                    cx.editor,
+                    *ls_id,
+                    helix_lsp::lsp::Command {
+                        title: command.clone(),
+                        arguments: None,
+                        command,
+                    },
+                );
+            }
+            [] => {
+                cx.editor.set_status(format!(
+                    "`{command}` is not supported for any language server"
+                ));
+            }
+            _ => {
+                cx.editor.set_status(format!(
+                    "`{command}` supported by multiple language servers"
+                ));
+            }
         }
     }
     Ok(())
@@ -1491,6 +1534,8 @@ fn lsp_stop(
         for doc in cx.editor.documents_mut() {
             if let Some(client) = doc.remove_language_server_by_name(ls_name) {
                 doc.clear_diagnostics(Some(client.id()));
+                doc.reset_all_inlay_hints();
+                doc.inlay_hints_oudated = true;
             }
         }
     }
@@ -1546,14 +1591,11 @@ fn tree_sitter_highlight_name(
         let text = doc.text().slice(..);
         let cursor = doc.selection(view.id).primary().cursor(text);
         let byte = text.char_to_byte(cursor);
-        let node = syntax
-            .tree()
-            .root_node()
-            .descendant_for_byte_range(byte, byte)?;
+        let node = syntax.descendant_for_byte_range(byte, byte)?;
         // Query the same range as the one used in syntax highlighting.
         let range = {
             // Calculate viewport byte ranges:
-            let row = text.char_to_line(view.offset.anchor.min(text.len_chars()));
+            let row = text.char_to_line(doc.view_offset(view.id).anchor.min(text.len_chars()));
             // Saturating subs to make it inclusive zero indexing.
             let last_line = text.len_lines().saturating_sub(1);
             let height = view.inner_area(doc).height;
@@ -2261,12 +2303,12 @@ fn run_shell_command(
     let args = args.join(" ");
 
     let callback = async move {
-        let (output, success) = shell_impl_async(&shell, &args, None).await?;
+        let output = shell_impl_async(&shell, &args, None).await?;
         let call: job::Callback = Callback::EditorCompositor(Box::new(
             move |editor: &mut Editor, compositor: &mut Compositor| {
                 if !output.is_empty() {
                     let contents = ui::Markdown::new(
-                        format!("```sh\n{}\n```", output),
+                        format!("```sh\n{}\n```", output.trim_end()),
                         editor.syn_loader.clone(),
                     );
                     let popup = Popup::new("shell", contents).position(Some(
@@ -2274,11 +2316,7 @@ fn run_shell_command(
                     ));
                     compositor.replace_or_push("shell", popup);
                 }
-                if success {
-                    editor.set_status("Command succeeded");
-                } else {
-                    editor.set_error("Command failed");
-                }
+                editor.set_status("Command run");
             },
         ));
         Ok(call)
@@ -2308,37 +2346,36 @@ fn reset_diff_change(
 
     let diff = handle.load();
     let doc_text = doc.text().slice(..);
-    let line = doc.selection(view.id).primary().cursor_line(doc_text);
-
-    let Some(hunk_idx) = diff.hunk_at(line as u32, true) else {
-        bail!("There is no change at the cursor")
-    };
-    let hunk = diff.nth_hunk(hunk_idx);
     let diff_base = diff.diff_base();
-    let before_start = diff_base.line_to_char(hunk.before.start as usize);
-    let before_end = diff_base.line_to_char(hunk.before.end as usize);
-    let text: Tendril = diff
-        .diff_base()
-        .slice(before_start..before_end)
-        .chunks()
-        .collect();
-    let anchor = doc_text.line_to_char(hunk.after.start as usize);
+    let mut changes = 0;
+
     let transaction = Transaction::change(
         doc.text(),
-        [(
-            anchor,
-            doc_text.line_to_char(hunk.after.end as usize),
-            (!text.is_empty()).then_some(text),
-        )]
-        .into_iter(),
+        diff.hunks_intersecting_line_ranges(doc.selection(view.id).line_ranges(doc_text))
+            .map(|hunk| {
+                changes += 1;
+                let start = diff_base.line_to_char(hunk.before.start as usize);
+                let end = diff_base.line_to_char(hunk.before.end as usize);
+                let text: Tendril = diff_base.slice(start..end).chunks().collect();
+                (
+                    doc_text.line_to_char(hunk.after.start as usize),
+                    doc_text.line_to_char(hunk.after.end as usize),
+                    (!text.is_empty()).then_some(text),
+                )
+            }),
     );
+    if changes == 0 {
+        bail!("There are no changes under any selection");
+    }
+
     drop(diff); // make borrow check happy
     doc.apply(&transaction, view.id);
-    // select inserted text
-    let text_len = before_end - before_start;
-    doc.set_selection(view.id, Selection::single(anchor, anchor + text_len));
     doc.append_changes_to_history(view);
     view.ensure_cursor_in_view(doc, scrolloff);
+    cx.editor.set_status(format!(
+        "Reset {changes} change{}",
+        if changes == 1 { "" } else { "s" }
+    ));
     Ok(())
 }
 
@@ -2407,66 +2444,86 @@ fn move_buffer(
 
     ensure!(args.len() == 1, format!(":move takes one argument"));
     let doc = doc!(cx.editor);
-
-    let new_path =
-        helix_stdx::path::canonicalize(&PathBuf::from(args.first().unwrap().to_string()));
     let old_path = doc
         .path()
-        .ok_or_else(|| anyhow!("Scratch buffer cannot be moved. Use :write instead"))?
+        .context("Scratch buffer cannot be moved. Use :write instead")?
         .clone();
-    let old_path_as_url = doc.url().unwrap();
-    let new_path_as_url = Url::from_file_path(&new_path).unwrap();
+    let new_path = args.first().unwrap().to_string();
+    if let Err(err) = cx.editor.move_path(&old_path, new_path.as_ref()) {
+        bail!("Could not move file: {err}");
+    }
+    Ok(())
+}
 
-    let edits: Vec<(
-        helix_lsp::Result<helix_lsp::lsp::WorkspaceEdit>,
-        OffsetEncoding,
-        String,
-    )> = doc
-        .language_servers()
-        .map(|lsp| {
-            (
-                lsp.prepare_file_rename(&old_path_as_url, &new_path_as_url),
-                lsp.offset_encoding(),
-                lsp.name().to_owned(),
-            )
-        })
-        .filter(|(f, _, _)| f.is_some())
-        .map(|(f, encoding, name)| (helix_lsp::block_on(f.unwrap()), encoding, name))
-        .collect();
-
-    for (lsp_reply, encoding, name) in edits {
-        match lsp_reply {
-            Ok(edit) => {
-                if let Err(e) = apply_workspace_edit(cx.editor, encoding, &edit) {
-                    log::error!(
-                        ":move command failed to apply edits from lsp {}: {:?}",
-                        name,
-                        e
-                    );
-                };
-            }
-            Err(e) => {
-                log::error!("LSP {} failed to treat willRename request: {:?}", name, e);
-            }
-        };
+fn yank_diagnostic(
+    cx: &mut compositor::Context,
+    args: &[Cow<str>],
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
     }
 
-    let doc = doc_mut!(cx.editor);
-
-    doc.set_path(Some(new_path.as_path()));
-    if let Err(e) = std::fs::rename(&old_path, &new_path) {
-        doc.set_path(Some(old_path.as_path()));
-        bail!("Could not move file: {}", e);
+    let reg = match args.first() {
+        Some(s) => {
+            ensure!(s.chars().count() == 1, format!("Invalid register {s}"));
+            s.chars().next().unwrap()
+        }
+        None => '+',
     };
 
-    doc.language_servers().for_each(|lsp| {
-        lsp.did_file_rename(&old_path_as_url, &new_path_as_url);
-    });
+    let (view, doc) = current_ref!(cx.editor);
+    let primary = doc.selection(view.id).primary();
 
-    cx.editor
-        .language_servers
-        .file_event_handler
-        .file_changed(new_path);
+    // Look only for diagnostics that intersect with the primary selection
+    let diag: Vec<_> = doc
+        .diagnostics()
+        .iter()
+        .filter(|d| primary.overlaps(&helix_core::Range::new(d.range.start, d.range.end)))
+        .map(|d| d.message.clone())
+        .collect();
+    let n = diag.len();
+    if n == 0 {
+        bail!("No diagnostics under primary selection");
+    }
+
+    cx.editor.registers.write(reg, diag)?;
+    cx.editor.set_status(format!(
+        "Yanked {n} diagnostic{} to register {reg}",
+        if n == 1 { "" } else { "s" }
+    ));
+    Ok(())
+}
+
+fn read(cx: &mut compositor::Context, args: &[Cow<str>], event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let scrolloff = cx.editor.config().scrolloff;
+    let (view, doc) = current!(cx.editor);
+
+    ensure!(!args.is_empty(), "file name is expected");
+    ensure!(args.len() == 1, "only the file name is expected");
+
+    let filename = args.first().unwrap();
+    let path = PathBuf::from(filename.to_string());
+    ensure!(
+        path.exists() && path.is_file(),
+        "path is not a file: {:?}",
+        path
+    );
+
+    let file = std::fs::File::open(path).map_err(|err| anyhow!("error opening file: {}", err))?;
+    let mut reader = BufReader::new(file);
+    let (contents, _, _) = read_to_string(&mut reader, Some(doc.encoding()))
+        .map_err(|err| anyhow!("error reading file: {}", err))?;
+    let contents = Tendril::from(contents);
+    let selection = doc.selection(view.id);
+    let transaction = Transaction::insert(doc.text(), selection, contents);
+    doc.apply(&transaction, view.id);
+    doc.append_changes_to_history(view);
+    view.ensure_cursor_in_view(doc, scrolloff);
 
     Ok(())
 }
@@ -2488,7 +2545,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "open",
-        aliases: &["o"],
+        aliases: &["o", "edit", "e"],
         doc: "Open a file from disk into the current view.",
         fun: open,
         signature: CommandSignature::all(completers::filename),
@@ -2587,7 +2644,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "format",
         aliases: &["fmt"],
-        doc: "Format the file using the LSP formatter.",
+        doc: "Format the file using an external formatter or language server.",
         fun: format,
         signature: CommandSignature::none(),
     },
@@ -2983,7 +3040,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     TypableCommand {
         name: "tree-sitter-subtree",
         aliases: &["ts-subtree"],
-        doc: "Display tree sitter subtree under cursor, primarily for debugging queries.",
+        doc: "Display the smallest tree-sitter subtree that spans the primary selection, primarily for debugging queries.",
         fun: tree_sitter_subtree,
         signature: CommandSignature::none(),
     },
@@ -3062,7 +3119,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &[],
         doc: "Clear given register. If no argument is provided, clear all registers.",
         fun: clear_register,
-        signature: CommandSignature::none(),
+        signature: CommandSignature::all(completers::register),
     },
     TypableCommand {
         name: "redraw",
@@ -3073,9 +3130,23 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "move",
-        aliases: &[],
+        aliases: &["mv"],
         doc: "Move the current buffer and its corresponding file to a different path",
         fun: move_buffer,
+        signature: CommandSignature::positional(&[completers::filename]),
+    },
+    TypableCommand {
+        name: "yank-diagnostic",
+        aliases: &[],
+        doc: "Yank diagnostic(s) under primary cursor to register, or clipboard by default",
+        fun: yank_diagnostic,
+        signature: CommandSignature::all(completers::register),
+    },
+    TypableCommand {
+        name: "read",
+        aliases: &["r"],
+        doc: "Load a file into buffer",
+        fun: read,
         signature: CommandSignature::positional(&[completers::filename]),
     },
 ];

@@ -117,10 +117,9 @@ FLAGS:
     setup_logging(args.verbosity).context("failed to initialize logging")?;
 
     // Before setting the working directory, resolve all the paths in args.files
-    for (path, _) in args.files.iter_mut() {
-        *path = helix_stdx::path::canonicalize(&path);
+    for (path, _) in &mut args.files {
+        *path = helix_stdx::path::canonicalize(&*path);
     }
-
     // NOTE: Set the working directory early so the correct configuration is loaded. Be aware that
     // Application::new() depends on this logic so it must be updated if this changes.
     if let Some(path) = &args.working_directory {
@@ -145,18 +144,18 @@ FLAGS:
         }
     };
 
-    let syn_loader_conf = helix_core::config::user_syntax_loader().unwrap_or_else(|err| {
-        eprintln!("Bad language config: {}", err);
+    let lang_loader = helix_core::config::user_lang_loader().unwrap_or_else(|err| {
+        eprintln!("{}", err);
         eprintln!("Press <ENTER> to continue with default language config");
         use std::io::Read;
         // This waits for an enter press.
         let _ = std::io::stdin().read(&mut []);
-        helix_core::config::default_syntax_loader()
+        helix_core::config::default_lang_loader()
     });
 
     // TODO: use the thread local executor to spawn the application task separately from the work pool
-    let mut app = Application::new(args, config, syn_loader_conf)
-        .context("unable to create new application")?;
+    let mut app =
+        Application::new(args, config, lang_loader).context("unable to create new application")?;
 
     let exit_code = app.run(&mut EventStream::new()).await?;
 
