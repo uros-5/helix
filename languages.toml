@@ -340,16 +340,17 @@ source = { git = "https://github.com/Beaglefoot/tree-sitter-awk", rev = "a799bc5
 [[language]]
 name = "protobuf"
 scope = "source.proto"
-injection-regex = "protobuf"
+injection-regex = "proto"
 file-types = ["proto"]
 language-servers = [ "bufls", "pbkit" ]
 comment-token = "//"
 block-comment-tokens = { start = "/*", end = "*/" }
 indent = { tab-width = 2, unit = "  " }
+grammar = "proto"
 
 [[grammar]]
-name = "protobuf"
-source = { git = "https://github.com/yusdacra/tree-sitter-protobuf", rev = "19c211a01434d9f03efff99f85e19f967591b175"}
+name = "proto"
+source = { git = "https://github.com/sdoerner/tree-sitter-proto", rev = "778ab6ed18a7fcf82c83805a87d63376c51e80bc"}
 
 [[language]]
 name = "textproto"
@@ -1315,7 +1316,7 @@ file-types = ["tl"]
 comment-tokens = "--"
 block-comment-tokens = { start = "--[[", end = "--]]" }
 roots = [ "tlconfig.lua" ]
-language-servers = [ "teal-lsp" ]
+language-servers = [ "teal-language-server" ]
 
 [[language]]
 name = "svelte"
@@ -3609,7 +3610,7 @@ source = { git = "https://github.com/mtoohey31/tree-sitter-ld", rev = "0e9695ae0
 name = "hyprlang"
 scope = "source.hyprlang"
 roots = ["hyprland.conf"]
-file-types = [ { glob = "hyprland.conf" }, { glob = "hyprpaper.conf" }, { glob = "hypridle.conf" }, { glob = "hyprlock.conf" } ]
+file-types = [ { glob = "hypr/*.conf" }]
 comment-token = "#"
 grammar = "hyprlang"
 language-servers = ["hyprls"]
@@ -4013,7 +4014,7 @@ indent = { tab-width = 4, unit = "    " }
 
 [[grammar]]
 name = "vento"
-source = { git = "https://github.com/ventojs/tree-sitter-vento", rev = "3321077d7446c1b3b017c294fd56ce028ed817fe" }
+source = { git = "https://github.com/ventojs/tree-sitter-vento", rev = "3b32474bc29584ea214e4e84b47102408263fe0e" }
 
 [[language]]
 name = "nginx"
