@@ -65,11 +65,6 @@ pub struct Application {
 
     config: Arc<ArcSwap<Config>>,
 
-    #[allow(dead_code)]
-    theme_loader: Arc<theme::Loader>,
-    #[allow(dead_code)]
-    syn_loader: Arc<ArcSwap<syntax::Loader>>,
-
     signals: Signals,
     jobs: Jobs,
     lsp_progress: LspProgressMap,
@@ -106,25 +101,7 @@ impl Application {
 
         let mut theme_parent_dirs = vec![helix_loader::config_dir()];
         theme_parent_dirs.extend(helix_loader::runtime_dirs().iter().cloned());
-        let theme_loader = std::sync::Arc::new(theme::Loader::new(&theme_parent_dirs));
-
-        let true_color = config.editor.true_color || crate::true_color();
-        let theme = config
-            .theme
-            .as_ref()
-            .and_then(|theme| {
-                theme_loader
-                    .load(theme)
-                    .map_err(|e| {
-                        log::warn!("failed to load theme `{}` - {}", theme, e);
-                        e
-                    })
-                    .ok()
-                    .filter(|theme| (true_color || theme.is_16_color()))
-            })
-            .unwrap_or_else(|| theme_loader.default_theme(true_color));
-
-        let syn_loader = Arc::new(ArcSwap::from_pointee(lang_loader));
+        let theme_loader = theme::Loader::new(&theme_parent_dirs);
 
         #[cfg(not(feature = "integration"))]
         let backend = CrosstermBackend::new(stdout(), &config.editor);
@@ -139,13 +116,14 @@ impl Application {
         let handlers = handlers::setup(config.clone());
         let mut editor = Editor::new(
             area,
-            theme_loader.clone(),
-            syn_loader.clone(),
+            Arc::new(theme_loader),
+            Arc::new(ArcSwap::from_pointee(lang_loader)),
             Arc::new(Map::new(Arc::clone(&config), |config: &Config| {
                 &config.editor
             })),
             handlers,
         );
+        Self::load_configured_theme(&mut editor, &config.load());
 
         let keys = Box::new(Map::new(Arc::clone(&config), |config: &Config| {
             &config.keys
@@ -163,7 +141,7 @@ impl Application {
 
             // If the first file is a directory, skip it and open a picker
             if let Some((first, _)) = files_it.next_if(|(p, _)| p.is_dir()) {
-                let picker = ui::file_picker(first, &config.load().editor);
+                let picker = ui::file_picker(&editor, first);
                 compositor.push(Box::new(overlaid(picker)));
             }
 
@@ -244,8 +222,6 @@ impl Application {
                 .unwrap_or_else(|_| editor.new_file(Action::VerticalSplit));
         }
 
-        editor.set_theme(theme);
-
         #[cfg(windows)]
         let signals = futures_util::stream::empty();
         #[cfg(not(windows))]
@@ -262,12 +238,7 @@ impl Application {
             compositor,
             terminal,
             editor,
-
             config,
-
-            theme_loader,
-            syn_loader,
-
             signals,
             jobs: Jobs::new(),
             lsp_progress: LspProgressMap::new(),
@@ -417,10 +388,9 @@ impl Application {
     fn refresh_language_config(&mut self) -> Result<(), Error> {
         let lang_loader = helix_core::config::user_lang_loader()?;
 
-        self.syn_loader.store(Arc::new(lang_loader));
-        self.editor.syn_loader = self.syn_loader.clone();
+        self.editor.syn_loader.store(Arc::new(lang_loader));
         for document in self.editor.documents.values_mut() {
-            document.detect_language(self.syn_loader.clone());
+            document.detect_language(self.editor.syn_loader.clone());
             let diagnostics = Editor::doc_diagnostics(
                 &self.editor.language_servers,
                 &self.editor.diagnostics,
@@ -432,34 +402,13 @@ impl Application {
         Ok(())
     }
 
-    /// Refresh theme after config change
-    fn refresh_theme(&mut self, config: &Config) -> Result<(), Error> {
-        let true_color = config.editor.true_color || crate::true_color();
-        let theme = config
-            .theme
-            .as_ref()
-            .and_then(|theme| {
-                self.theme_loader
-                    .load(theme)
-                    .map_err(|e| {
-                        log::warn!("failed to load theme `{}` - {}", theme, e);
-                        e
-                    })
-                    .ok()
-                    .filter(|theme| (true_color || theme.is_16_color()))
-            })
-            .unwrap_or_else(|| self.theme_loader.default_theme(true_color));
-
-        self.editor.set_theme(theme);
-        Ok(())
-    }
-
     fn refresh_config(&mut self) {
         let mut refresh_config = || -> Result<(), Error> {
             let default_config = Config::load_default()
                 .map_err(|err| anyhow::anyhow!("Failed to load config: {}", err))?;
             self.refresh_language_config()?;
-            self.refresh_theme(&default_config)?;
+            // Refresh theme after config change
+            Self::load_configured_theme(&mut self.editor, &default_config);
             self.terminal
                 .reconfigure(default_config.editor.clone().into())?;
             // Store new config
@@ -475,6 +424,37 @@ impl Application {
                 self.editor.set_error(err.to_string());
             }
         }
+    }
+
+    /// Load the theme set in configuration
+    fn load_configured_theme(editor: &mut Editor, config: &Config) {
+        let true_color = config.editor.true_color || crate::true_color();
+        let theme = config
+            .theme
+            .as_ref()
+            .and_then(|theme| {
+                editor
+                    .theme_loader
+                    .load(theme)
+                    .map_err(|e| {
+                        log::warn!("failed to load theme `{}` - {}", theme, e);
+                        e
+                    })
+                    .ok()
+                    .filter(|theme| {
+                        let colors_ok = true_color || theme.is_16_color();
+                        if !colors_ok {
+                            log::warn!(
+                                "loaded theme `{}` but cannot use it because true color \
+                                support is not enabled",
+                                theme.name()
+                            );
+                        }
+                        colors_ok
+                    })
+            })
+            .unwrap_or_else(|| editor.theme_loader.default_theme(true_color));
+        editor.set_theme(theme);
     }
 
     #[cfg(windows)]
